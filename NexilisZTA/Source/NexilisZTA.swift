@@ -11,7 +11,12 @@ import Foundation
 // CocoaPods builds Swift and Objective-C as one mixed-language target, so these
 // types are already in scope. SwiftPM has no mixed target, so the Objective-C and
 // C half is its own module and has to be imported.
-import NexilisZTACore
+//
+// Re-exported so that `import NexilisZTA` alone puts RASPGuard, AppAttestManager,
+// stateGet/stateSet and the NXEncrypted* functions in scope, exactly as the pod
+// does. Without this a SwiftPM consumer would have to import the core module too,
+// and the same integration code would not compile under both build systems.
+@_exported import NexilisZTACore
 #endif
 
 /// Everything the ZTA layer needs from the app that embeds it.
