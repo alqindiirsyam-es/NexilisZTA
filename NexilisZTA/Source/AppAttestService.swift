@@ -30,9 +30,42 @@ public class AppAttestService {
         return false
     }
 
+    // MARK: - Errors
+
+    /// A step that cannot run reports why rather than failing silently. A bare `false, nil` left
+    /// the screen with nothing to say but "an unknown error occurred", and support with no code
+    /// to work from - which is exactly what a reader saw after the app had been closed for days.
+    private func flowStateError(_ stage: String) -> NSError {
+        return NSError(
+            domain: NXAppAttestErrorDomain,
+            code: NXAppAttestError.flowStateInvalid.rawValue,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Verifikasi keamanan belum siap untuk tahap \(stage).",
+                NSLocalizedFailureReasonErrorKey: "Status alur \(stateGet()) tidak sesuai untuk \(stage)."
+            ]
+        )
+    }
+
+    private func unsupportedError() -> NSError {
+        return NSError(
+            domain: NXAppAttestErrorDomain,
+            code: NXAppAttestError.notSupported.rawValue,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Perangkat ini tidak mendukung App Attest.",
+                NSLocalizedFailureReasonErrorKey: "Butuh iPhone dengan chip A12 atau lebih baru dan iOS 16+."
+            ]
+        )
+    }
+
     // MARK: - Configure endpoints
     public func configure() {
-        guard stateGet() == NX_STATE_PERIODIC_MONITORING else {
+        // The RASP chain (states 1-15) runs once per process and must have completed; the attest
+        // sub-chain after it has to be restartable. It was pinned to `== PERIODIC_MONITORING`, so
+        // a second attempt - the backoff, or the reader pressing "Coba Lagi" - found the state
+        // already past 15, returned without arming anything, and then every step below rejected
+        // its own guard. That is why a failed verification stayed failed until the app was killed,
+        // however good the connection had become.
+        guard stateGet() >= NX_STATE_PERIODIC_MONITORING else {
             return
         }
         let manager = AppAttestManager.shared()
@@ -53,11 +86,11 @@ public class AppAttestService {
     public func registerDevice(completion: @escaping (Bool, Error?) -> Void) {
         guard isSupported else {
             print("[AppAttest] Device tidak support App Attest (butuh A12+)")
-            completion(false, nil)
+            completion(false, unsupportedError())
             return
         }
         guard stateGet() == NX_STATE_APPATTEST_ENDPOINT_CONFIG else {
-            completion(false, nil)
+            completion(false, flowStateError("registrasi perangkat"))
             return
         }
         let manager = AppAttestManager.shared()
@@ -88,12 +121,12 @@ public class AppAttestService {
     // MARK: - Assert (subsequent launches)
     public func performAssertion(completion: @escaping (Bool, Error?) -> Void) {
         guard isSupported else {
-            completion(false, nil)
+            completion(false, unsupportedError())
             return
         }
         let state = stateGet()
         guard state == NX_STATE_APPATTEST_DEVICE_REGISTRATION || state == NX_STATE_APPATTEST_ENDPOINT_CONFIG else {
-            completion(false, nil)
+            completion(false, flowStateError("assertion"))
             return
         }
 
@@ -120,11 +153,11 @@ public class AppAttestService {
     // MARK: - Request key delivery
     public func requestKeyDelivery(completion: @escaping (Data?, Error?) -> Void) {
         guard isSupported else {
-            completion(nil, nil)
+            completion(nil, unsupportedError())
             return
         }
         guard stateGet() == NX_STATE_APPATTEST_ASSERTION else {
-            completion(nil, nil)
+            completion(nil, flowStateError("pengiriman kunci"))
             return
         }
 

@@ -29,6 +29,15 @@ typedef NS_ENUM(NSInteger, NXAppAttestError) {
     NXAppAttestErrorNetworkFailed     = 1008,
     NXAppAttestErrorDecodeFailed      = 1009,
     NXAppAttestErrorCryptoFailed      = 1010,
+    /* The boot chain was not where this step needs it to be. Reported instead of a bare
+     * failure so the screen and the support inbox can name the stage that stopped. */
+    NXAppAttestErrorFlowStateInvalid  = 1011,
+    /* The server could not answer right now - a gateway error, a timeout, a rate limit. Kept
+     * apart from ServerRejected, which means the server understood the request and said no:
+     * one clears itself in a minute, the other is a decision about this device. Collapsing
+     * both into ServerRejected is what put a reader in front of a screen with no way forward
+     * for what was only a busy backend. */
+    NXAppAttestErrorServerUnavailable = 1012,
 };
 
 @interface AppAttestManager : NSObject

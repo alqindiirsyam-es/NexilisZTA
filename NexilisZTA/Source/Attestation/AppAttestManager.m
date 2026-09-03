@@ -63,6 +63,18 @@ static NSError *NXError(NSInteger code, NSString *message) {
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @"Unknown error"}];
 }
 
+/*
+ * Tells "the server is busy" apart from "the server said no". A 502 from a gateway, a 504 while a
+ * backend restarts, a 429 under load - all of those clear themselves, and none of them are a
+ * statement about this device. They were reported with the same code as a genuine policy refusal,
+ * and that code is the one the screen treats as final, which is how a reader ended up looking at
+ * an error with no retry offered for a backend that was fine again a minute later.
+ */
+static NSError *NXServerError(NSInteger statusCode, NSString *message) {
+    BOOL transient = (statusCode >= 500) || (statusCode == 408) || (statusCode == 429) || (statusCode == 0);
+    return NXError(transient ? NXAppAttestErrorServerUnavailable : NXAppAttestErrorServerRejected, message);
+}
+
 static NSString *NXEscapeJSONString(NSString *input) {
     NSMutableString *s = [NSMutableString stringWithCapacity:input.length + 8];
     for (NSUInteger i = 0; i < input.length; i++) {
@@ -487,8 +499,8 @@ static NSString *NXDeviceModel(void) {
         if (error) { completion(nil, nil, error); return; }
         NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
         if (httpResp.statusCode != 200) {
-            completion(nil, nil, NXError(NXAppAttestErrorServerRejected,
-                                         [NSString stringWithFormat:@"Challenge returned %ld", (long)httpResp.statusCode]));
+            completion(nil, nil, NXServerError(httpResp.statusCode,
+                                               [NSString stringWithFormat:@"Challenge returned %ld", (long)httpResp.statusCode]));
             return;
         }
 
@@ -605,7 +617,7 @@ static NSString *NXDeviceModel(void) {
                         NSInteger statusCode = response.statusCode;
                         if (statusCode != 200 && statusCode != 201) {
                             NSString *message = [json[@"error"] isKindOfClass:[NSString class]] ? json[@"error"] : [NSString stringWithFormat:@"Server rejected attestation: %ld", (long)statusCode];
-                            completion(NO, NXError(NXAppAttestErrorServerRejected, message));
+                            completion(NO, NXServerError(statusCode, message));
                             return;
                         }
                         [self saveKeyIdToKeychain:keyId];
@@ -633,7 +645,18 @@ static NSString *NXDeviceModel(void) {
     }
     NSString *currentFingerprint = [self deliveryKeyFingerprintFromPublicKey:deliveryPubKey];
     NSString *storedFingerprint = [self deliveryKeyFingerprint];
-    if (storedFingerprint.length > 0 && [storedFingerprint isEqualToString:currentFingerprint]) {
+    /*
+     * The fingerprint only says the delivery key on THIS device has not changed. It says nothing
+     * about whether the server still holds the matching registration, and the server's copy is
+     * bound to a session that expires. Skipping the re-registration on a fingerprint match alone
+     * meant that once the session had lapsed - which is what a two or three day gap guarantees -
+     * key delivery was asked for against a record the server had already let go, and it failed
+     * every launch with a rejection no retry could clear. A live session is the second half of
+     * the condition: while one is valid, nothing needs re-sending; once it is gone, the delivery
+     * key is registered again so the server's record is current before the key is asked for.
+     */
+    BOOL sessionStillValid = [[SessionManager sharedManager] hasValidSession];
+    if (storedFingerprint.length > 0 && [storedFingerprint isEqualToString:currentFingerprint] && sessionStillValid) {
         completion(YES, nil);
         return;
     }
@@ -680,7 +703,7 @@ static NSString *NXDeviceModel(void) {
                 NSInteger statusCode = response.statusCode;
                 if (statusCode != 200) {
                     NSString *message = [json[@"error"] isKindOfClass:[NSString class]] ? json[@"error"] : [NSString stringWithFormat:@"Server rejected delivery-key registration: %ld", (long)statusCode];
-                    completion(NO, NXError(NXAppAttestErrorServerRejected, message));
+                    completion(NO, NXServerError(statusCode, message));
                     return;
                 }
                 [self saveDeliveryKeyFingerprint:currentFingerprint];
@@ -768,7 +791,7 @@ static NSString *NXDeviceModel(void) {
                     NSInteger statusCode = response.statusCode;
                     if (statusCode != 200) {
                         NSString *message = [jsonResp[@"error"] isKindOfClass:[NSString class]] ? jsonResp[@"error"] : [NSString stringWithFormat:@"Key delivery rejected: %ld", (long)statusCode];
-                        completion(nil, NXError(NXAppAttestErrorServerRejected, message));
+                        completion(nil, NXServerError(statusCode, message));
                         return;
                     }
                     if (![jsonResp isKindOfClass:[NSDictionary class]]) {
