@@ -137,10 +137,28 @@ Rantai RASP — jailbreak, debugger, Frida, injection, hook, state 1 sampai 15 �
 | `primaryPin` | SPKI pin host ZTA, bentuk `sha256/<base64>`. Nil memakai pin bawaan |
 | `backupPin` | pin tujuan rotasi. Nil memakai bawaan |
 | `featureAccessURL` | sumber policy feature access. Nil memakai URL bawaan, yang **tidak** diturunkan dari `baseURL` |
+| `appAttest` | `false` menghentikan rantai sebelum tahap attestation, untuk host yang identitasnya belum terdaftar |
 | `showsErrorScreen` | `false` kalau host mau menampilkan layar gagalnya sendiri |
 | `onFailure` | dipanggil setelah percobaan otomatis habis, membawa error yang menghentikan rantai |
 
 Tujuh endpoint diturunkan otomatis dari `baseURL` dengan path baku: `/zta/challenge`, `/zta/attest`, `/zta/assert`, `/zta/status/verify`, `/zta/register`, `/zta/key`, `/zta/revoke`. Kalau ada yang berbeda, susun `NexilisZTAConfiguration` sendiri lalu oper ke `APISZTA.configure(_:showsErrorScreen:onFailure:onReady:)`.
+
+### Host baru yang identitasnya belum terdaftar
+
+App Attest baru menghasilkan jawaban yang berguna setelah Team ID dan bundle identifier aplikasi terdaftar di layanan ZTA. Sebelum pendaftaran itu ada, setiap peluncuran berhenti di layar gagal dengan server menolak attestation yang tidak dikenalnya, dan host tidak pernah sampai ke sesinya sendiri untuk bisa diintegrasikan sama sekali.
+
+`appAttest: false` menghentikan rantai tepat sebelum tahap attestation. Pemeriksaan RASP, pemasangan pin dan gerbang feature access tetap jalan, lalu `onReady` dipanggil.
+
+```swift
+APISZTA.configure(
+    baseURL: "…", appName: "…", apiKey: "…", primaryPin: "sha256/…",
+    appAttest: false
+) {
+    APIS.connect(appName: "…", apiKey: "…", delegate: self)
+}
+```
+
+Sakelar ini hanya bisa mengurangi. Flag `device_check_attestation` dari layanan tetap mematikan attestation untuk host yang membiarkan sakelar ini menyala, dan menyalakannya tidak bisa membatalkan layanan yang sudah mematikannya. Nyalakan lagi begitu identitas aplikasi terdaftar.
 
 ### Kalau host mau layar gagalnya sendiri
 

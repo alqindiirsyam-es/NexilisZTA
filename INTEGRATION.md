@@ -83,6 +83,29 @@ policy service has to name it.
 Left unconfigured, the layer runs on the values compiled into `EncryptedStrings.mm`, which are
 OneApp's — that host needs to name nothing.
 
+### A host whose identity is not registered yet
+
+App Attest only produces a usable answer once the app's Team ID and bundle identifier are
+registered on the ZTA service. Until that registration exists, every launch ends on the failure
+screen with the server refusing an attestation it has no record of, and the host never reaches its
+own session to be integrated at all.
+
+`appAttest: false` stops the chain just before the attestation steps. The RASP checks, the pinning
+and the feature-access gate still run, and `onReady` is reached.
+
+```swift
+APISZTA.configure(
+    baseURL: "…", appName: "…", apiKey: "…", primaryPin: "sha256/…",
+    appAttest: false
+) {
+    APIS.connect(appName: "…", apiKey: "…", delegate: self)
+}
+```
+
+The switch can only subtract: the service's own `device_check_attestation` flag still turns
+attestation off for a host that leaves the switch on, and turning the switch on cannot override a
+service that has switched it off. Turn it back on once the identity is registered.
+
 ### A screen of the host's own
 
 `showsErrorScreen: false` keeps `ZTAErrorViewController` out of the way; `onFailure` then carries

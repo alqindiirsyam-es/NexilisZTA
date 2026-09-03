@@ -128,6 +128,10 @@ public enum APISZTA {
     ///   - primaryPin: SPKI pin of the ZTA host, `sha256/<base64>`. Nil keeps the built-in one.
     ///   - backupPin: the pin a rotation switches to. Nil keeps the built-in one.
     ///   - featureAccessURL: nil derives it from `baseURL`.
+    ///   - appAttest: false stops the chain before the attestation steps. A new host cannot attest
+    ///     until its Team ID and bundle identifier are registered on the ZTA service, and until
+    ///     they are, every launch ends on the failure screen. Off, the RASP checks, the pinning
+    ///     and the feature-access gate still run, and `onReady` is reached without attestation.
     ///   - showsErrorScreen: whether the layer presents its own failure screen. Turn it off to
     ///     show one of the host's own from `onFailure`.
     ///   - onFailure: called once the automatic attempts are spent, with the failure that stopped
@@ -140,6 +144,7 @@ public enum APISZTA {
                                  primaryPin: String? = nil,
                                  backupPin: String? = nil,
                                  featureAccessURL: String? = nil,
+                                 appAttest: Bool = true,
                                  showsErrorScreen: Bool = true,
                                  onFailure: ((Error) -> Void)? = nil,
                                  onReady: @escaping () -> Void) {
@@ -148,7 +153,8 @@ public enum APISZTA {
                                           apiKey: apiKey,
                                           primaryPin: primaryPin,
                                           backupPin: backupPin,
-                                          featureAccessURL: featureAccessURL),
+                                          featureAccessURL: featureAccessURL,
+                                          appAttestEnabled: appAttest),
                   showsErrorScreen: showsErrorScreen,
                   onFailure: onFailure,
                   onReady: onReady)
@@ -271,6 +277,14 @@ public enum APISZTA {
             return
         }
 
+        guard configuration.appAttestEnabled else {
+            // The host has said it does not attest. The policy answer could only agree, and it is
+            // fetched under a key this host may not own yet, so the round trip is skipped.
+            NXLogger.appAttest.publicInfo("[AppAttest] Dimatikan oleh host, chain berhenti sebelum attestation.")
+            afterFeatureAccess()
+            return
+        }
+
         fetchFeatureAccess()
     }
 
@@ -335,8 +349,14 @@ public enum APISZTA {
         startAttestFlow()
     }
 
+    /// Two gates, and either one turns attestation off.
+    ///
+    /// The host's own switch comes first because it is the one that applies before there is
+    /// anything to ask: a host whose identity is not registered on the service yet cannot attest,
+    /// and asking the policy service under someone else's key would not tell it so.
     private static var attestationRequired: Bool {
-        (UserDefaults.standard.string(forKey: featureAccessKey) ?? "1") == "1"
+        guard configuration.appAttestEnabled else { return false }
+        return (UserDefaults.standard.string(forKey: featureAccessKey) ?? "1") == "1"
     }
 
     private static func startAttestFlow() {

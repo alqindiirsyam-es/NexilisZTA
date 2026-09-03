@@ -52,6 +52,20 @@ public struct NexilisZTAConfiguration {
     /// Address the failure screen's "Hubungi Support" opens a mail to.
     public var supportEmail: String
 
+    /// Whether this host attests at all.
+    ///
+    /// App Attest only produces a usable answer once the app's identity - its Team ID and bundle
+    /// identifier - is registered on the ZTA service. Until that registration exists, every launch
+    /// of a new host ends on the failure screen with the server refusing an attestation it has no
+    /// record of, and the host cannot get as far as its own session to be integrated at all. Off,
+    /// the chain still runs the RASP checks, the pinning and the feature-access gate, and simply
+    /// stops before the attestation steps.
+    ///
+    /// This is a local decision and it can only subtract: the server's own `device_check_attestation`
+    /// flag still turns attestation off for a host that leaves this on, and turning this on cannot
+    /// override a server that has switched it off.
+    public var appAttestEnabled: Bool
+
     /// Builds a configuration from the compiled-in values - OneApp's, today.
     public init() {
         self.baseURL = NXEncryptedAPIBaseURL()
@@ -68,6 +82,7 @@ public struct NexilisZTAConfiguration {
         self.apiKey = NXEncryptedAPIKey()
         self.featureAccessURL = NXEncryptedFeatureAccessURL()
         self.supportEmail = "support@nexilis.io"
+        self.appAttestEnabled = true
     }
 
     /// Points every endpoint at a service of the host's own, keeping the paths.
@@ -81,12 +96,15 @@ public struct NexilisZTAConfiguration {
     ///   - featureAccessURL: where the feature-access policy is pulled from. Nil keeps the
     ///     compiled-in one, which is not derived from `baseURL` - it sits at its own path on its
     ///     own host - so a host running its own policy service has to name it here.
+    ///   - appAttestEnabled: false stops the chain before the attestation steps, for a host whose
+    ///     identity is not registered on the service yet.
     public init(baseURL: String,
                 appName: String,
                 apiKey: String,
                 primaryPin: String? = nil,
                 backupPin: String? = nil,
-                featureAccessURL: String? = nil) {
+                featureAccessURL: String? = nil,
+                appAttestEnabled: Bool = true) {
         self.init()
         let root = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.baseURL = root + "/"
@@ -102,5 +120,6 @@ public struct NexilisZTAConfiguration {
         if let primaryPin { self.primaryPin = primaryPin }
         if let backupPin { self.backupPin = backupPin }
         if let featureAccessURL { self.featureAccessURL = featureAccessURL }
+        self.appAttestEnabled = appAttestEnabled
     }
 }
