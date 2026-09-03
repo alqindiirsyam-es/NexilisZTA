@@ -73,7 +73,7 @@ public class AppAttestService {
         // The endpoints come from the configuration rather than straight from the compiled-in
         // constants, so a host can point the layer at a service of its own. With no configure()
         // call the configuration holds those same constants.
-        let config = NexilisZTA.configuration
+        let config = APISZTA.configuration
         manager.challengeEndpoint    = config.challengeEndpoint
         manager.attestEndpoint       = config.attestEndpoint
         manager.registerEndpoint     = config.registerEndpoint

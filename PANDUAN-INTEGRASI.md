@@ -93,42 +93,72 @@ Dari situ Swift bisa mengakses `RASPGuard`, `AppAttestManager`, `AppAttestServic
 
 ---
 
-## Langkah 4 — Konfigurasi
+## Langkah 4 — Satu panggilan
 
-Panggil sekali di awal, sebelum ada request apa pun ke jaringan.
+Panggil sekali di `application(_:didFinishLaunchingWithOptions:)`, sebelum ada request apa pun ke jaringan. Closure terakhirnya dipanggil **hanya kalau seluruh pemeriksaan lulus**, dan di situlah host memulai sesinya sendiri.
 
 ```swift
 func application(_ application: UIApplication,
                  didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
 
-    NexilisZTA.configure(
+    APISZTA.configure(
         baseURL:    "https://server-anda.com/zta-ios",
         appName:    "NamaAppAnda",
         apiKey:     "…",
-        primaryPin: "sha256/…",
-        backupPin:  "sha256/…"
-    )
+        primaryPin: "sha256/…"
+    ) {
+        // Baru di sini sesi host dimulai. Kalau verifikasi gagal, blok ini tidak pernah jalan.
+        APIS.connect(appName: "NamaAppAnda", apiKey: "…", delegate: self)
+    }
 
-    mulaiVerifikasi()
     return true
 }
 ```
 
-Tujuh endpoint diturunkan otomatis dari `baseURL` dengan path baku: `/zta/challenge`, `/zta/attest`, `/zta/assert`, `/zta/status/verify`, `/zta/register`, `/zta/key`, `/zta/revoke`.
+Di balik satu panggilan itu berjalan:
 
-Kalau ada endpoint yang berbeda path-nya, susun `NexilisZTAConfiguration` sendiri lalu oper ke `NexilisZTA.configure(_:)`.
+| Tahap | Isi |
+| --- | --- |
+| Pin | `RASPGuard` dipasangi primary dan backup pin |
+| Feature access | tanya server apakah app ini memang wajib attestation |
+| App Attest | registrasi kalau belum terdaftar, lalu assertion, lalu key delivery |
+| Percobaan ulang | enam kali diam-diam dengan jeda membesar sampai 16 detik |
+| Jaringan mati | rantai diparkir, bukan dihitung gagal, dan lanjut sendiri saat jaringan kembali |
+| Layar gagal | `ZTAErrorViewController` muncul setelah percobaan otomatis habis |
 
-`configure` sekaligus mengerjakan dua hal yang hanya dilakukan sekali: memasang certificate pin dan mengisi endpoint App Attest.
+Rantai RASP — jailbreak, debugger, Frida, injection, hook, state 1 sampai 15 — sudah jalan sebelum semua ini: `RASPBridge` memasangnya dari `+load`, sebelum `main`.
 
-### Kalau ingin memisah dua langkah itu
+### Parameter
 
-OneApp sengaja tidak memakai `configure`, karena ia memasang pin saat launch tapi menahan endpoint App Attest sampai policy-nya bilang attestation memang aktif. Kalau host butuh pemisahan serupa:
+| Parameter | Arti |
+| --- | --- |
+| `baseURL` | akar layanan ZTA, dengan atau tanpa garis miring di ujung |
+| `appName`, `apiKey` | identitas host di sisi Nexilis |
+| `primaryPin` | SPKI pin host ZTA, bentuk `sha256/<base64>`. Nil memakai pin bawaan |
+| `backupPin` | pin tujuan rotasi. Nil memakai bawaan |
+| `featureAccessURL` | sumber policy feature access. Nil memakai URL bawaan, yang **tidak** diturunkan dari `baseURL` |
+| `showsErrorScreen` | `false` kalau host mau menampilkan layar gagalnya sendiri |
+| `onFailure` | dipanggil setelah percobaan otomatis habis, membawa error yang menghentikan rantai |
+
+Tujuh endpoint diturunkan otomatis dari `baseURL` dengan path baku: `/zta/challenge`, `/zta/attest`, `/zta/assert`, `/zta/status/verify`, `/zta/register`, `/zta/key`, `/zta/revoke`. Kalau ada yang berbeda, susun `NexilisZTAConfiguration` sendiri lalu oper ke `APISZTA.configure(_:showsErrorScreen:onFailure:onReady:)`.
+
+### Kalau host mau layar gagalnya sendiri
 
 ```swift
-RASPGuard.shared().configurePinning(withPrimaryPin: "sha256/…", backupPin: "sha256/…")
-// … nanti, setelah policy diketahui:
-AppAttestService.shared.configure()
+APISZTA.configure(
+    baseURL: "…", appName: "…", apiKey: "…", primaryPin: "sha256/…",
+    showsErrorScreen: false,
+    onFailure: { error in
+        // tampilkan layar sendiri; panggil APISZTA.retry() dari tombol coba lagi
+    }
+) {
+    APIS.connect(appName: "…", apiKey: "…", delegate: self)
+}
 ```
+
+### Kalau host mau menjalankan rantainya sendiri
+
+`APISZTA.applyConfiguration(_:)` menyimpan konfigurasi, memasang pin dan mengisi endpoint App Attest, lalu berhenti di situ. Sesudahnya host memanggil `AppAttestService` tahap demi tahap seperti pada Langkah 5. Ini jalur yang dipakai OneApp sebelum semua ini ada.
 
 ### Mendapatkan nilai pin
 
@@ -156,7 +186,7 @@ performAssertion  →  state 22
 requestKeyDelivery→  state 23   ← baru di sini app boleh jalan
 ```
 
-Template lengkap:
+`APISZTA.configure` menjalankan seluruh urutan itu dan memeriksa sendiri bahwa state berakhir di 23 sebelum memanggil closure sukses. Bagian di bawah ini hanya diperlukan host yang memilih jalur manual lewat `applyConfiguration`.
 
 ```swift
 private func mulaiVerifikasi() {
@@ -220,7 +250,7 @@ private func lanjutKeAplikasi() {
 }
 ```
 
-Pengecekan ini penting: tanpa itu, app yang gagal di tengah rantai tetap jalan seolah verifikasinya lulus.
+Pengecekan ini penting: tanpa itu, app yang gagal di tengah rantai tetap jalan seolah verifikasinya lulus. Lewat `APISZTA.configure` pemeriksaan ini sudah dilakukan library.
 
 ---
 
@@ -228,32 +258,18 @@ Pengecekan ini penting: tanpa itu, app yang gagal di tengah rantai tetap jalan s
 
 Kegagalan datang sebagai `NSError` berdomain `NXAppAttestErrorDomain`, dengan `code` berisi nomor tahap terakhir yang tercapai — ini yang dipakai support untuk melacak macetnya di mana.
 
-Sebagian besar kegagalan sifatnya sesaat: jaringan belum siap sedetik setelah app di-resume, atau layanan attestation Apple sedang sibuk. Disarankan mengulang diam-diam beberapa kali dengan jeda yang membesar sebelum menampilkan apa pun ke pengguna:
+Sebagian besar kegagalan sifatnya sesaat: jaringan belum siap sedetik setelah app di-resume, atau layanan attestation Apple sedang sibuk. `APISZTA` sudah menangani itu sendiri:
 
-```swift
-private var percobaan = 0
-private let maksimalPercobaanOtomatis = 3
+- enam percobaan diam-diam, jeda 2, 4, 8, 16, 16 detik, sebelum pengguna melihat apa pun
+- kegagalan tanpa jaringan tidak menghabiskan jatah percobaan, rantai diparkir sampai jaringan kembali
+- app yang kembali ke depan setelah gagal mencoba lagi dengan sendirinya
+- `ZTAErrorViewController` muncul setelah jatah habis, lengkap dengan tombol **Coba Lagi**, satu percobaan otomatis lagi setelah 15 detik, dan tautan **Hubungi Support**
 
-private func tampilkanGagal(_ error: Error?) {
-    percobaan += 1
-    guard percobaan >= maksimalPercobaanOtomatis else {
-        let jeda = pow(2.0, Double(percobaan))          // 2s, 4s, 8s
-        DispatchQueue.main.asyncAfter(deadline: .now() + jeda) { [weak self] in
-            self?.mulaiVerifikasi()
-        }
-        return
-    }
-    // tampilkan layar "Verifikasi Gagal" dengan tombol Coba Lagi
-}
-```
+Tombol Coba Lagi memanggil `APISZTA.retry()`, yang membuang dulu registrasi lama sebelum mengulang — registrasi yang sudah rusak akan gagal dengan cara yang sama persis kalau dipakai ulang. Host bisa memanggil `APISZTA.retry()` sendiri dari mana saja.
 
-Untuk tombol **Coba Lagi**, jangan hanya mengulang rantai yang sama — registrasi yang sudah rusak akan gagal dengan cara yang sama persis. Buang dulu registrasinya:
+Kalau host mau mengamati tanpa closure, tersedia tiga notifikasi dengan nama yang sama seperti sebelumnya: `.ztaSessionReady`, `.ztaSessionError` yang membawa `userInfo["error"]`, dan `.ztaSessionRetry` yang meminta rantai diulang.
 
-```swift
-AppAttestManager.shared().clearRegistration()
-UserDefaults.standard.removeObject(forKey: "nx_appattest_env")
-mulaiVerifikasi()
-```
+Alamat pada tautan Hubungi Support diambil dari `supportEmail` di `NexilisZTAConfiguration`, bawaannya `support@nexilis.io`.
 
 ---
 

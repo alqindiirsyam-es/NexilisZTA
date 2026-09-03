@@ -42,6 +42,7 @@ let package = Package(
             dependencies: ["NexilisZTACore"],
             path: "NexilisZTA/Source",
             sources: [
+                "APISZTA.swift",
                 "AppAttestService.swift",
                 "Input/SecureInputHardening.swift",
                 "Input/SecureNumericKeypad.swift",
@@ -50,7 +51,9 @@ let package = Package(
                 "NexilisZTA.swift",
                 "NXLogger.swift",
                 "Security/DuressAndGeofence.swift",
-                "Security/SecuritySupport.swift"
+                "Security/SecuritySupport.swift",
+                "Support/ZTAReachability.swift",
+                "UI/ZTAErrorViewController.swift"
             ]
         )
     ],

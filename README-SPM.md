@@ -7,7 +7,7 @@ secure input, privacy shield, and session teardown.
 ## Install
 
 ```swift
-.package(url: "https://github.com/alqindiirsyam-es/NexilisZTA.git", from: "1.0.1")
+.package(url: "https://github.com/alqindiirsyam-es/NexilisZTA.git", from: "1.1.0")
 ```
 
 Then add the product to your target:
@@ -23,10 +23,14 @@ In Xcode: **File → Add Package Dependencies…**, paste the URL above.
 ```swift
 import NexilisZTA
 
-NexilisZTA.configure(
-    baseURL: "https://your.host",
-    // …
-)
+APISZTA.configure(
+    baseURL:    "https://your.host",
+    appName:    "YourApp",
+    apiKey:     "…",
+    primaryPin: "sha256/…"
+) {
+    // verification passed — start the host's session here
+}
 ```
 
 Only `NexilisZTA` is meant to be imported. `NexilisZTACore` exists for the reason below
@@ -91,7 +95,7 @@ git push https://github.com/alqindiirsyam-es/NexilisZTA.git spm-nexeliszta:main
 # Tag it. Keep the tag in step with spec.version in the podspec, so CocoaPods and
 # SwiftPM consumers get the same code for a given version number.
 git clone https://github.com/alqindiirsyam-es/NexilisZTA.git /tmp/NexilisZTA
-cd /tmp/NexilisZTA && git tag 1.0.1 && git push origin 1.0.1
+cd /tmp/NexilisZTA && git tag 1.1.0 && git push origin 1.1.0
 ```
 
 The podspec resolves from the same tag:
@@ -108,7 +112,7 @@ trunk validation does, so nothing has to be worked around.
 ## CocoaPods
 
 ```ruby
-pod 'NexilisZTA', '1.0.1'
+pod 'NexilisZTA', '1.1.0'
 ```
 
 See `INTEGRATION.md` (English) or `PANDUAN-INTEGRASI.md` (Bahasa Indonesia) for the

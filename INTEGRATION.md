@@ -49,30 +49,52 @@ These cannot live in a library — they belong to the app that ships:
 | `com.apple.developer.networking.wifi-info` | app entitlements — only if `NetworkPosture` reads the SSID |
 | `NSLocationWhenInUseUsageDescription` | Info.plist — only if `GeofencePolicy` is used |
 
-## Configuration
+## One call
 
-`configure` is optional. Left uncalled, the layer runs on the values compiled into
-`EncryptedStrings.mm`, which are OneApp's — that host needs to do nothing.
-
-Any other host points it at its own service:
+`APISZTA.configure` is the whole integration. It runs the layer's chain and calls back only once
+verification has passed, which is where the host starts its own session:
 
 ```swift
-NexilisZTA.configure(
-    baseURL: "https://your.host/zta-ios",
-    appName: "YourApp",
-    apiKey:  "…",
-    primaryPin: "sha256/…",
-    backupPin:  "sha256/…"
-)
+APISZTA.configure(
+    baseURL:    "https://your.host/zta-ios",
+    appName:    "YourApp",
+    apiKey:     "…",
+    primaryPin: "sha256/…"
+) {
+    APIS.connect(appName: "YourApp", apiKey: "…", delegate: self)
+}
 ```
+
+Behind that one call: the certificate pins, the feature-access gate that says whether this app has
+to attest at all, App Attest registration, assertion and key delivery, six quiet retries with a
+growing backoff, a park-and-resume for a device with no network, and the failure screen once the
+automatic attempts are spent. The RASP half — states 1 to 15 — has already run by then;
+`RASPBridge` installs it from `+load`, before `main`.
+
+Call it from `application(_:didFinishLaunchingWithOptions:)`, before anything reaches the network.
 
 The seven endpoints are derived from `baseURL` with the paths the service already uses
 (`/zta/challenge`, `/zta/attest`, `/zta/assert`, `/zta/status/verify`, `/zta/register`, `/zta/key`,
-`/zta/revoke`). Pass a fully built `NexilisZTAConfiguration` instead if any of them differs.
+`/zta/revoke`). Pass a fully built `NexilisZTAConfiguration` to
+`APISZTA.configure(_:showsErrorScreen:onFailure:onReady:)` instead if any of them differs.
+`featureAccessURL` is the exception: it is not derived from `baseURL`, so a host running its own
+policy service has to name it.
 
-`configure` applies the two things that are applied once — the certificate pins and the App Attest
-endpoints — so call it from `application(_:didFinishLaunchingWithOptions:)`, before anything
-reaches the network.
+Left unconfigured, the layer runs on the values compiled into `EncryptedStrings.mm`, which are
+OneApp's — that host needs to name nothing.
+
+### A screen of the host's own
+
+`showsErrorScreen: false` keeps `ZTAErrorViewController` out of the way; `onFailure` then carries
+the error that stopped the chain, and `APISZTA.retry()` runs it again with the old registration
+thrown away first. The same three notifications are posted either way: `.ztaSessionReady`,
+`.ztaSessionError` with `userInfo["error"]`, and `.ztaSessionRetry`.
+
+### Driving the steps by hand
+
+`APISZTA.applyConfiguration(_:)` stores the configuration, applies the pins and the App Attest
+endpoints, and stops there — for a host that wants to call `AppAttestService` step by step itself.
+That is what OneApp did before any of this existed.
 
 ### The obfuscated constants
 
@@ -119,7 +141,7 @@ once per launch; `AppAttestService` refuses to move if the previous step has not
 Typical flow, as OneApp drives it:
 
 ```swift
-RASPGuard.shared().configurePinning(withPrimaryPin: …, backupPin: …)   // or NexilisZTA.configure
+RASPGuard.shared().configurePinning(withPrimaryPin: …, backupPin: …)   // or APISZTA.configure
 AppAttestService.shared.configure()                                    // -> state 16
 AppAttestService.shared.registerDevice { … }                           // -> state 21
 AppAttestService.shared.performAssertion { … }                         // -> state 22
@@ -128,7 +150,7 @@ AppAttestService.shared.requestKeyDelivery { key, error in … }         // -> s
 
 Failures arrive as `NSError` in the `NXAppAttestErrorDomain` domain.
 
-OneApp calls those two setup steps itself rather than going through `NexilisZTA.configure`, and on
+OneApp calls those two setup steps itself rather than going through `APISZTA.configure`, and on
 purpose: it pins at launch but holds the App Attest endpoints back until its feature-access policy
 says attestation is on at all. `configure` does both at once, which is right for a host with no
 such switch and wrong for this one. A host that wants the split can call
