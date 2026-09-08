@@ -26,7 +26,17 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)configurePinningWithPrimaryPin:(nullable NSString *)primaryPin
                              backupPin:(nullable NSString *)backupPin;
+- (void)configureAdditionalPins:(NSArray<NSString *> *)pins forHost:(NSString *)host;
+/// Compiled-in pins for first-party hosts that are not the ZTA host. Kept apart from the rotation
+/// pins above, which a signed payload replaces wholesale.
+- (void)configureHostPinFloor:(NSDictionary<NSString *, NSArray<NSString *> *> *)pinsByHost;
+- (void)configureExpectedBundleID:(NSString *)bundleID
+                     applicationID:(NSString *)applicationID
+                            teamID:(NSString *)teamID
+              appAttestEnvironment:(NSString *)environment;
 - (void)startMonitoring;
+/// Re-evaluates a launch-time finding until it clears, without running the response path.
+- (void)startRecoveryReevaluation;
 - (void)stopMonitoring;
 - (BOOL)verifyCodeSignatureIntegrity;
 - (uint32_t)runChecksNow;
@@ -44,6 +54,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, weak, nullable) id<RASPGuardDelegate> delegate;
 @property (nonatomic, readonly) uint32_t lastThreatMask;
 @property (nonatomic, readonly) BOOL deviceClean;
+@property (nonatomic, readonly) BOOL pinningConfigured;
+@property (nonatomic, readonly) BOOL releaseIdentityConfigured;
 
 @end
 

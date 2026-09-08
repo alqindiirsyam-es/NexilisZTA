@@ -51,7 +51,7 @@ static const NSTimeInterval kDefaultMaxAge = 60.0;
         @"threat_mask": @(threats),
         @"threats_detected": @(threats != RASP_THREAT_NONE),
         @"rasp_clean": @(threats == RASP_THREAT_NONE),
-        @"pinning_enabled": @(guard != nil),
+        @"pinning_enabled": @(guard.pinningConfigured),
         @"timestamp_ms": @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0)),
     } mutableCopy];
     [report addEntriesFromDictionary:[NetworkPosture currentPosture]];

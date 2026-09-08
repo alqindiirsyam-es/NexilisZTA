@@ -85,7 +85,13 @@ public final class SecureNumericKeypad: UIView {
     @objc private func tap(_ sender: UIButton) {
         // Reject taps delivered while obscured by an overlay.
         if sender.window?.windowScene?.windows.contains(where: { $0.isHidden == false && $0 !== sender.window }) == true {
-            // best-effort; the durable control is that iOS does not stack foreign overlays
+            SecurityAuditChain.append(event: "secure_keypad_overlay_rejected")
+            // The tap is dropped at every mode - an obscured keypad never registers a digit.
+            // Only .hsa also treats the overlay as reason to end the session.
+            if NXSecurityPolicy.isHSA() {
+                APISZTA.revokeLocalAuthorization(reason: "secure keypad obscured by another visible window")
+            }
+            return
         }
         if sender.tag == -1 { backspace() }
         else if sender.tag >= 0 { append(UInt8(48 + sender.tag)) }

@@ -19,12 +19,43 @@
 
 // Dua layer kunci: XOR pertama + XOR kedua setelah shuffle
 // Produksi: inject NEXILIS_XOR_KEY dan NEXILIS_XOR_KEY2 via CI, jangan hardcode di repo
-#ifndef NEXILIS_XOR_KEY
-#define NEXILIS_XOR_KEY  0x5AU
-#endif
+//
+// The two fallback constants below live in this file, which means they live in the repository,
+// which means they are not a secret from anyone who can read it. That is fine for development and
+// not fine for a release: a build that ships them obfuscates its strings with a key the attacker
+// already has, and the obfuscation stops being protection and becomes a speed bump in front of
+// `strings`.
+//
+// So a release build declares itself, and a release build that declares itself has to bring its
+// own keys. `NEXILIS_RELEASE_HARDENING` is set by SentinelReleaseHardening.xcconfig, and the keys
+// come from the per-build secrets file that config includes - generated at build time, never
+// committed.
+//
+// Missing keys are a compile error rather than a quiet fallback, and that is the entire point.
+// A quiet fallback is the failure mode this exists to catch: it would build, it would ship, and
+// nothing about it would look wrong until someone ran `strings` on the IPA.
+#if defined(NEXILIS_RELEASE_HARDENING)
 
-#ifndef NEXILIS_XOR_KEY2
-#define NEXILIS_XOR_KEY2 0xA3U
+# if !defined(NEXILIS_XOR_KEY) || !defined(NEXILIS_XOR_KEY2)
+#  error "Release hardening requires per-build NEXILIS_XOR_KEY and NEXILIS_XOR_KEY2 injected by CI (see SentinelPerBuildSecrets.xcconfig.example)"
+
+// A key of zero is XOR with nothing: it satisfies the check above while leaving every string in
+// the binary in the clear. `#elif` and not a second `#if`, because an undefined macro compares
+// equal to 0 here too - chaining them would report both faults for the one cause.
+# elif (NEXILIS_XOR_KEY) == 0 || (NEXILIS_XOR_KEY2) == 0
+#  error "NEXILIS_XOR_KEY and NEXILIS_XOR_KEY2 must be non-zero; a zero key encrypts nothing"
+# endif
+
+#else
+
+# ifndef NEXILIS_XOR_KEY
+#  define NEXILIS_XOR_KEY  0x5AU
+# endif
+
+# ifndef NEXILIS_XOR_KEY2
+#  define NEXILIS_XOR_KEY2 0xA3U
+# endif
+
 #endif
 
 namespace nexilis {

@@ -38,7 +38,7 @@ extern "C" {
 #define NX_STATE_PERIODIC_MONITORING           15 /* startMonitoring armed                    */
 #define NX_STATE_APPATTEST_ENDPOINT_CONFIG     16 /* AppAttestService.configure               */
 #define NX_STATE_APPATTEST_DEVICE_REGISTRATION 21 /* AppAttestManager registerDevice          */
-#define NX_STATE_APPATTEST_ASSERTION           22 /* AppAttestManager generateAssertion       */
+#define NX_STATE_APPATTEST_ASSERTION           22 /* server-verified key-delivery assertion   */
 #define NX_STATE_APPATTEST_KEY_DELIVERY        23 /* AppAttestManager requestKeyDelivery      */
 
 int32_t stateGet(void);

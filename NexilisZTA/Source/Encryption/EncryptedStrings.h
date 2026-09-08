@@ -18,8 +18,6 @@ extern "C" {
 extern NSString *NXEncryptedAPIBaseURL(void);
 extern NSString *NXEncryptedChallengeEndpoint(void);
 extern NSString *NXEncryptedAttestEndpoint(void);
-extern NSString *NXEncryptedAssertEndpoint(void);
-extern NSString *NXEncryptedStatusVerifyEndpoint(void);
 extern NSString *NXEncryptedRegisterEndpoint(void);
 extern NSString *NXEncryptedKeyEndpoint(void);
 extern NSString *NXEncryptedRevokeEndpoint(void);
@@ -27,6 +25,7 @@ extern NSString *NXEncryptedRevokeEndpoint(void);
 // P1 — Certificate pinning
 extern NSString *NXEncryptedPrimaryPin(void);
 extern NSString *NXEncryptedBackupPin(void);
+extern NSString *NXEncryptedNewUniversePin(void);
 
 // P2 — App API key  [baru: F1 fix]
 extern NSString *NXEncryptedAPIKey(void);

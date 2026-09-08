@@ -23,11 +23,14 @@ public class AppAttestService {
     private init() {}
 
     // MARK: - Check support
+    /// Whether this device can attest *and* be accepted by the service.
+    ///
+    /// Both halves matter. App Attest exists from iOS 14, but the ZTA service refuses anything
+    /// below its own `minIosMajor` - so on an iOS 15 device the hardware answers yes, the
+    /// registration goes out, and the server rejects it. That reads as a failed launch rather
+    /// than an unsupported device, and at app mode 3 it stopped an app that used to run.
     public var isSupported: Bool {
-        if #available(iOS 16.0, *) {
-            return DCAppAttestService.shared.isSupported
-        }
-        return false
+        AppAttestManager.shared().isSupported
     }
 
     // MARK: - Errors
@@ -52,7 +55,7 @@ public class AppAttestService {
             code: NXAppAttestError.notSupported.rawValue,
             userInfo: [
                 NSLocalizedDescriptionKey: "Perangkat ini tidak mendukung App Attest.",
-                NSLocalizedFailureReasonErrorKey: "Butuh iPhone dengan chip A12 atau lebih baru dan iOS 16+."
+                NSLocalizedFailureReasonErrorKey: "Butuh iPhone dengan chip A12 atau lebih baru dan iOS \(AppAttestManager.shared().minimumOSMajor)+."
             ]
         )
     }
@@ -79,6 +82,7 @@ public class AppAttestService {
         manager.registerEndpoint     = config.registerEndpoint
         manager.keyDeliveryEndpoint  = config.keyDeliveryEndpoint
         manager.revokeEndpoint       = config.revokeEndpoint
+        manager.statusVerifyEndpoint = config.statusVerifyEndpoint
         stateSet(NX_STATE_APPATTEST_ENDPOINT_CONFIG) // -> 16
     }
 
@@ -118,37 +122,9 @@ public class AppAttestService {
         }
     }
 
-    // MARK: - Assert (subsequent launches)
-    public func performAssertion(completion: @escaping (Bool, Error?) -> Void) {
-        guard isSupported else {
-            completion(false, unsupportedError())
-            return
-        }
-        let state = stateGet()
-        guard state == NX_STATE_APPATTEST_DEVICE_REGISTRATION || state == NX_STATE_APPATTEST_ENDPOINT_CONFIG else {
-            completion(false, flowStateError("assertion"))
-            return
-        }
-
-        let manager = AppAttestManager.shared()
-
-        // Generate clientData untuk assertion
-        let clientData = "nexilis-assertion-\(Date().timeIntervalSince1970)"
-            .data(using: .utf8) ?? Data()
-
-        manager.generateAssertion(forClientData: clientData) { assertion, error in
-            DispatchQueue.main.async {
-                if assertion != nil {
-                    NXLogger.appAttest.publicInfo("[AppAttest] ✅ Assertion berhasil")
-                    stateSet(NX_STATE_APPATTEST_ASSERTION) // -> 22
-                    completion(true, nil)
-                } else {
-                    NXLogger.appAttest.publicError("[AppAttest] ❌ Assertion gagal: \(error?.localizedDescription ?? "unknown")")
-                    completion(false, error)
-                }
-            }
-        }
-    }
+    // The previous local-only `performAssertion()` API was removed: generating an assertion
+    // without server adjudication is not a security state. The nonce-bound assertion inside
+    // requestKeyDelivery() is the authoritative server-verified assertion.
 
     // MARK: - Request key delivery
     public func requestKeyDelivery(completion: @escaping (Data?, Error?) -> Void) {
@@ -156,8 +132,10 @@ public class AppAttestService {
             completion(nil, unsupportedError())
             return
         }
-        guard stateGet() == NX_STATE_APPATTEST_ASSERTION else {
-            completion(nil, flowStateError("pengiriman kunci"))
+        let currentState = stateGet()
+        guard currentState == NX_STATE_APPATTEST_DEVICE_REGISTRATION ||
+              currentState == NX_STATE_APPATTEST_ENDPOINT_CONFIG else {
+            completion(nil, flowStateError("pengiriman kunci/server assertion"))
             return
         }
 
@@ -168,13 +146,16 @@ public class AppAttestService {
             "threat_mask":  Int(RASPGuard.shared().lastThreatMask),
             "rasp_clean":   RASPGuard.shared().deviceClean as Bool,
             "os_version":   UIDevice.current.systemVersion,
-            "device_model": UIDevice.current.model
+            "device_model": UIDevice.current.model,
+            "audit_head": SecurityAuditChain.headHash(),
+            "audit_chain_valid": SecurityAuditChain.verifyChain()
         ]
 
         manager.requestKeyDelivery(withPosture: posture) { decryptionKey, error in
             DispatchQueue.main.async {
                 if let key = decryptionKey {
-                    NXLogger.appAttest.publicInfo("[AppAttest] ✅ Key delivered (\(key.count) bytes)")
+                    NXLogger.appAttest.publicInfo("[AppAttest] ✅ Server verified assertion and delivered key (\(key.count) bytes)")
+                    stateSet(NX_STATE_APPATTEST_ASSERTION)
                     stateSet(NX_STATE_APPATTEST_KEY_DELIVERY)
                     completion(key, nil)
                 } else {
@@ -182,6 +163,50 @@ public class AppAttestService {
                     completion(nil, error)
                 }
             }
+        }
+    }
+
+    // MARK: - Protected asset
+
+    /// Opens the bundled sealed asset, if this build ships one.
+    ///
+    /// This is the whole point of key delivery: the key never lives in the app, so the asset is
+    /// readable only by an install that has just proved through App Attest that it is genuine,
+    /// unmodified, and running on real Apple hardware. Pulling the IPA gets an attacker the
+    /// ciphertext and nothing else.
+    ///
+    /// The delivered key is zeroed as soon as the asset is open, so it exists for the length of
+    /// one decryption rather than the length of the session.
+    ///
+    /// - Note: A build with no sealed asset fails with `ProtectedAssetStore.Failure.missing`.
+    ///   Check `ProtectedAssetStore.isAvailable()` first where that is a legitimate configuration
+    ///   rather than an error.
+    public func requestProtectedAsset(completion: @escaping (Data?, Error?) -> Void) {
+        requestKeyDelivery { key, error in
+            guard var delivered = key else {
+                completion(nil, error)
+                return
+            }
+            defer { delivered.resetBytes(in: 0 ..< delivered.count) }
+            do { completion(try ProtectedAssetStore.decrypt(deliveredKey: delivered), nil) }
+            catch { completion(nil, error) }
+        }
+    }
+
+    /// The scoped form, and the one production call sites should use: the plaintext is handed to
+    /// `body` and zeroed on the way out, so no caller ends up deciding where to keep it.
+    public func withProtectedAsset(_ body: @escaping (Data) throws -> Void,
+                                   failure: @escaping (Error) -> Void) {
+        requestKeyDelivery { key, error in
+            guard var delivered = key else {
+                failure(error ?? NSError(
+                    domain: "io.nexilis.zta.protectedasset", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "key delivery returned no key"]))
+                return
+            }
+            defer { delivered.resetBytes(in: 0 ..< delivered.count) }
+            do { try ProtectedAssetStore.withDecryptedAsset(deliveredKey: delivered, body) }
+            catch { failure(error) }
         }
     }
 

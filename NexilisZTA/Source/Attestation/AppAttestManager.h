@@ -38,6 +38,7 @@ typedef NS_ENUM(NSInteger, NXAppAttestError) {
      * both into ServerRejected is what put a reader in front of a screen with no way forward
      * for what was only a busy backend. */
     NXAppAttestErrorServerUnavailable = 1012,
+    NXAppAttestErrorPinningFailed      = 1013,
 };
 
 @interface AppAttestManager : NSObject
@@ -49,21 +50,52 @@ typedef NS_ENUM(NSInteger, NXAppAttestError) {
 @property (nonatomic, strong, nullable) NSString *registerEndpoint;
 @property (nonatomic, strong, nullable) NSString *keyDeliveryEndpoint;
 @property (nonatomic, strong, nullable) NSString *revokeEndpoint;
+/// Where a live session is re-checked, and where the server hands back the signals it cannot
+/// push: a revoked install, a signed pin rotation. Modes 1 and 2 only.
+@property (nonatomic, strong, nullable) NSString *statusVerifyEndpoint;
 
+/// Lowest iOS major version this app may attest from.
+///
+/// App Attest itself exists from iOS 14, but the ZTA service refuses a registration below its own
+/// `minIosMajor` and answers `NXAppAttestErrorServerRejected`. Asking anyway turns a device the
+/// service was never going to accept into a failed launch, so the client holds the same line and
+/// reports it as unsupported instead. Defaults to 16, which is the service's own default.
+@property (nonatomic, assign) NSInteger minimumOSMajor;
 @property (nonatomic, readonly) BOOL isSupported;
 @property (nonatomic, readonly) BOOL isRegistered;
 @property (nonatomic, readonly, nullable) NSString *keyId;
+#if DEBUG
+/// Development-only escape hatch. This symbol is absent from non-Debug builds.
 @property (nonatomic, assign) BOOL bypassPinningForDev;
+#endif
 
 - (void)registerDeviceWithCompletion:(NXAttestRegistrationCompletion)completion;
 - (void)refreshDeliveryKeyRegistrationWithCompletion:(NXAttestRegistrationCompletion)completion;
 - (void)generateAssertionForClientData:(NSData *)clientData completion:(NXAssertionCompletion)completion;
 - (void)requestKeyDeliveryWithPosture:(NSDictionary *)devicePosture completion:(NXKeyDeliveryCompletion)completion;
+/// Re-checks the live session against the server and returns whatever it answered.
+///
+/// The request is a nonce-bound App Attest assertion over the same canonical body the server
+/// verifies, so a reply cannot be replayed and the poll cannot be spoofed by the network. The
+/// audit head travels with it to be witnessed.
+- (void)verifySessionStatusWithAuditHead:(nullable NSString *)auditHead
+                              completion:(void (^)(NSDictionary * _Nullable status,
+                                                   NSError * _Nullable error))completion;
+/// X9.63 (uncompressed point) public half of the Secure Enclave approval key, base64.
+///
+/// Reading it never presents a prompt - only using the private half does - and creating the key
+/// when it is missing does not either. Returns nil on a device where the key cannot exist, such as
+/// one with no biometry enrolled, and a nil here is not a failure: the caller simply omits the
+/// field, and the server then refuses sensitive decisions rather than accepting a weaker proof.
+- (nullable NSString *)approvalPublicKeyBase64;
+
 - (void)signTransactionData:(NSData *)data
                  completion:(void (^)(NSData * _Nullable signature,
                                       NSError * _Nullable error))completion;
 - (void)clearRegistration;
 - (void)clearRegistrationWithCompletion:(nullable NXServerCleanupCompletion)completion;
+/// Emergency/duress path: destroys local App Attest registration and Secure-Enclave delivery/signing keys synchronously.
+- (void)clearLocalRegistrationImmediately;
 - (void)resetURLSession;
 
 @end

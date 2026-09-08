@@ -21,6 +21,7 @@ let package = Package(
                 "RASP/RASPGuard.m",
                 "Security/EnvironmentReport.m",
                 "Security/NetworkPosture.m",
+                "Security/NXSecurityPolicy.m",
                 "Security/PrivacyShield.m",
                 "Security/SessionManager.m"
             ],
@@ -51,7 +52,12 @@ let package = Package(
                 "NexilisZTA.swift",
                 "NXLogger.swift",
                 "Security/DuressAndGeofence.swift",
+                "Security/OnDeviceStatisticalModel.swift",
+                "Security/SecurityPackPolicyValidator.swift",
+                "Security/ProtectedAssetStore.swift",
                 "Security/SecuritySupport.swift",
+                "Security/TelemetryLoop.swift",
+                "Security/ThreatIntelMatcher.swift",
                 "Support/ZTAReachability.swift",
                 "UI/ZTAErrorViewController.swift"
             ]

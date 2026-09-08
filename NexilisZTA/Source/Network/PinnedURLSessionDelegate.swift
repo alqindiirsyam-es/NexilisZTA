@@ -60,7 +60,7 @@ public final class PinnedURLSessionDelegate: NSObject, URLSessionTaskDelegate, U
         //     -serverTrust:matchesPinnedSPKIForHost:). PinSetStore adds rotated pins.
         if RASPGuard.shared().isPinnedHost(host) {
             if RASPGuard.shared().serverTrust(trust, matchesPinnedSPKIForHost: host)
-                || PinSetStore.matches(trust: trust) {
+                || PinSetStore.matches(trust: trust, host: host) {
                 completionHandler(.useCredential, URLCredential(trust: trust))
             } else {
                 RASPGuard.shared().reportPinningFailure(forHost: host)

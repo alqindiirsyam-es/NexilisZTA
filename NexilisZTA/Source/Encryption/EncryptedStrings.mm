@@ -27,14 +27,6 @@ NSString *NXEncryptedAttestEndpoint(void) {
     return ENCRYPTED_NSSTRING("https://nexilis.io/zta-ios/zta/attest");
 }
 
-NSString *NXEncryptedAssertEndpoint(void) {
-    return ENCRYPTED_NSSTRING("https://nexilis.io/zta-ios/zta/assert");
-}
-
-NSString *NXEncryptedStatusVerifyEndpoint(void) {
-    return ENCRYPTED_NSSTRING("https://nexilis.io/zta-ios/zta/status/verify");
-}
-
 NSString *NXEncryptedRegisterEndpoint(void) {
     return ENCRYPTED_NSSTRING("https://nexilis.io/zta-ios/zta/register");
 }
@@ -53,7 +45,15 @@ NSString *NXEncryptedPrimaryPin(void) {
 }
 
 NSString *NXEncryptedBackupPin(void) {
-    return ENCRYPTED_NSSTRING("sha256/tIAA8SPvbLBRxOAeQYkymqN3MhVpPuJFAbfLxihiMAU=");
+    return @""; // no fake backup: production must inject an independent backup pin
+}
+
+// The second first-party domain. It is not the ZTA host, so it is not covered by the
+// primary/backup floor above - that pair is one host's key and its rotation successor, not a
+// list of every domain the app talks to. Installed hosts have always pinned this separately;
+// dropping it would refuse every connection they make to it.
+NSString *NXEncryptedNewUniversePin(void) {
+    return ENCRYPTED_NSSTRING("sha256/XFRSd92XlkDObEZQZnAC8eULRrmHCTW4prdwSBYr/N4=");
 }
 
 NSString *NXEncryptedAppName(void) {
@@ -70,8 +70,8 @@ NSString *NXEncryptedAPIKey(void) {
 }
 #else
 NSString *NXEncryptedAPIKey(void) {
-    // Fallback untuk debug build — nilai placeholder
-    return ENCRYPTED_NSSTRING("38747683290F62E9667A018F490396EAE47BC16ADECD85B7E865C733E6DBD6A2");
+    // A client-embedded fallback must never become an authentication credential.
+    return @"";
 }
 #endif
 

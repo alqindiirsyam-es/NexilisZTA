@@ -71,6 +71,11 @@ static bool check_suspicious_paths(void) {
         "/usr/bin/ssh",
         "/bin/bash",
         "/Library/LaunchDaemons/com.saurik.Cydia.Startup.plist",
+        /* Modern rootless jailbreak layouts (Dopamine/palera1n rootless and derivatives). */
+        "/var/jb",
+        "/var/jb/usr/bin/ssh",
+        "/var/jb/Library/MobileSubstrate/MobileSubstrate.dylib",
+        "/var/jb/Library/TweakInject",
         NULL
     };
     struct stat st;
@@ -102,6 +107,21 @@ static bool check_dyld_images_for(const char **needles) {
             if (strstr(name, needles[j]) != NULL) {
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+static bool check_dyld_rootless_path_anomaly(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name == NULL) continue;
+        if (strstr(name, "/var/jb/") != NULL ||
+            strstr(name, "/Library/TweakInject/") != NULL ||
+            (strstr(name, "/private/preboot/") != NULL &&
+             (strstr(name, "/jb-") != NULL || strstr(name, "/procursus/") != NULL || strstr(name, "/ellekit/") != NULL))) {
+            return true;
         }
     }
     return false;
@@ -172,6 +192,7 @@ static bool nx_detect_jailbreak(void) {
     if (check_suspicious_paths()) return true;
     if (check_writable_system())  return true;
     if (check_dyld_images_for(jb_libs)) return true;
+    if (check_dyld_rootless_path_anomaly()) return true;
     if (check_env_injection())    return true;
     if (check_symlinks())         return true;
 #if !defined(NEXILIS_APPSTORE_BUILD) && !defined(NX_XCODE_DEBUG_RUN)
@@ -352,6 +373,10 @@ static bool nx_detect_inline_hooks(void) {
     const void *targets[] = {
         dlsym(RTLD_DEFAULT, "stat"),
         dlsym(RTLD_DEFAULT, "open"),
+        dlsym(RTLD_DEFAULT, "sysctl"),
+        dlsym(RTLD_DEFAULT, "socket"),
+        dlsym(RTLD_DEFAULT, "connect"),
+        dlsym(RTLD_DEFAULT, "_dyld_get_image_name"),
         (const void *)&task_threads,
         NULL
     };
@@ -362,41 +387,76 @@ static bool nx_detect_inline_hooks(void) {
 }
 
 /* ---- B8: fishhook-style symbol rebinding --------------------------------- */
-/* fishhook rewrites __la_symbol_ptr / __got slots. We resolve a handful of
- * imported symbols and confirm each target lies inside a legitimately mapped,
- * file-backed system image (dyld image range) rather than an app-writable or
- * anonymous region. Conservative: only flags clear out-of-image targets. */
-static bool addr_in_any_dyld_image(uintptr_t addr) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const struct mach_header_64 *mh =
-            (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (mh == NULL) continue;
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        const uint8_t *cmd = (const uint8_t *)(mh + 1);
-        for (uint32_t c = 0; c < mh->ncmds; c++) {
-            const struct load_command *lc = (const struct load_command *)cmd;
-            if (lc->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                uintptr_t start = (uintptr_t)(seg->vmaddr + slide);
-                uintptr_t end = start + (uintptr_t)seg->vmsize;
-                if (addr >= start && addr < end) return true;
-            }
-            cmd += lc->cmdsize;
-        }
-    }
+/* Walk the main executable's indirect symbol pointer sections. fishhook changes these slots;
+ * checking dlsym() itself cannot see that rewrite. For security-critical imports, the resolved
+ * target must remain inside an Apple system image. */
+static bool nx_is_critical_import(const char *name) {
+    if (name == NULL) return false;
+    if (name[0] == '_') name++;
+    const char *critical[] = {"open", "stat", "sysctl", "socket", "connect", "task_threads", "dyld_get_image_name", NULL};
+    for (int i = 0; critical[i] != NULL; i++) if (strcmp(name, critical[i]) == 0) return true;
     return false;
 }
 
+static bool nx_pointer_is_system_function(const void *ptr) {
+    if (ptr == NULL) return false;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr(ptr, &info) == 0 || info.dli_fname == NULL) return false;
+    return strncmp(info.dli_fname, "/usr/lib/", 9) == 0 ||
+           strncmp(info.dli_fname, "/System/Library/", 16) == 0;
+}
+
 static bool nx_detect_symbol_rebinding(void) {
-    // Gunakan dlsym — hindari re-deklarasi extern yang konflik
-    void *fns[] = {
-        dlsym(RTLD_DEFAULT, "open"),
-        (void *)&task_threads,
-        NULL
-    };
-    for (int i = 0; fns[i] != NULL; i++) {
-        if (!addr_in_any_dyld_image((uintptr_t)fns[i])) return true;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (mh == NULL || mh->magic != MH_MAGIC_64) return true;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+
+    const struct symtab_command *symtabCmd = NULL;
+    const struct dysymtab_command *dysymtabCmd = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    const uint8_t *cmd = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cmd;
+        if (lc->cmd == LC_SYMTAB) symtabCmd = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_DYSYMTAB) dysymtabCmd = (const struct dysymtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
+        }
+        cmd += lc->cmdsize;
+    }
+    if (symtabCmd == NULL || dysymtabCmd == NULL || linkedit == NULL) return true;
+
+    uintptr_t linkeditBase = (uintptr_t)(slide + linkedit->vmaddr - linkedit->fileoff);
+    const struct nlist_64 *symbols = (const struct nlist_64 *)(linkeditBase + symtabCmd->symoff);
+    const char *strings = (const char *)(linkeditBase + symtabCmd->stroff);
+    const uint32_t *indirect = (const uint32_t *)(linkeditBase + dysymtabCmd->indirectsymoff);
+
+    cmd = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cmd;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sect = (const struct section_64 *)(seg + 1);
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                uint32_t type = sect[j].flags & SECTION_TYPE;
+                if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                size_t count = (size_t)(sect[j].size / sizeof(void *));
+                void * const *bindings = (void * const *)(slide + sect[j].addr);
+                uint32_t offset = sect[j].reserved1;
+                for (size_t k = 0; k < count; k++) {
+                    uint32_t symbolIndex = indirect[offset + (uint32_t)k];
+                    if (symbolIndex == INDIRECT_SYMBOL_ABS || symbolIndex == INDIRECT_SYMBOL_LOCAL ||
+                        symbolIndex == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+                    if (symbolIndex >= symtabCmd->nsyms) return true;
+                    const char *name = strings + symbols[symbolIndex].n_un.n_strx;
+                    if (!nx_is_critical_import(name)) continue;
+                    if (!nx_pointer_is_system_function(bindings[k])) return true;
+                }
+            }
+        }
+        cmd += lc->cmdsize;
     }
     return false;
 }

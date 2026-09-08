@@ -17,8 +17,13 @@
 #import <signal.h>
 #import <os/log.h>
 #import "GlobalState.h"
+#import "SessionManager.h"
+#import "NXSecurityPolicy.h"
+#import <stdatomic.h>
 
 // Log channel khusus RASP — private agar tidak terbaca di Console.app tanpa entitlement
+static NSData *nx_spki_for_key(SecKeyRef key);
+
 static os_log_t _rasp_log(void) {
     static os_log_t log = NULL;
     static dispatch_once_t once;
@@ -32,33 +37,44 @@ static os_log_t _rasp_log(void) {
 #define NEXILIS_RASP_TERMINATE_ON_THREAT 1
 #endif
 
-#if NEXILIS_APPSTORE_BUILD && !defined(NEXILIS_ALLOW_INSECURE_RELEASE)
-  #if !defined(NEXILIS_EXPECTED_BUNDLE_ID)
-    #error "Release build requires NEXILIS_EXPECTED_BUNDLE_ID"
-  #endif
-  #if !defined(NEXILIS_EXPECTED_APP_ID)
-    #error "Release build requires NEXILIS_EXPECTED_APP_ID"
-  #endif
-  #if !defined(NEXILIS_EXPECTED_TEAM_ID)
-    #error "Release build requires NEXILIS_EXPECTED_TEAM_ID"
-  #endif
-  #if !defined(NEXILIS_EXPECTED_APPATTEST_ENV)
-    #error "Release build requires NEXILIS_EXPECTED_APPATTEST_ENV"
-  #endif
-  #if !defined(NEXILIS_EXPECTED_EXECUTABLE_SHA256)
-    #error "Release build requires NEXILIS_EXPECTED_EXECUTABLE_SHA256"
-  #endif
-#endif
 
 @interface RASPGuard ()
 @property (nonatomic, strong, nullable) dispatch_source_t monitorTimer;
+@property (nonatomic, strong, nullable) dispatch_source_t recoveryTimer;
 @property (nonatomic, copy, nullable) NSString *primaryPin;
 @property (nonatomic, copy, nullable) NSString *backupPin;
+@property (nonatomic, copy) NSDictionary<NSString *, NSArray<NSString *> *> *additionalPinsByHost;
+@property (nonatomic, copy) NSDictionary<NSString *, NSArray<NSString *> *> *hostPinFloor;
+@property (nonatomic, copy, nullable) NSString *expectedBundleID;
+@property (nonatomic, copy, nullable) NSString *expectedApplicationID;
+@property (nonatomic, copy, nullable) NSString *expectedTeamID;
+@property (nonatomic, copy, nullable) NSString *expectedAppAttestEnvironment;
 @property (nonatomic, readwrite) uint32_t lastThreatMask;
 @property (nonatomic, readwrite) BOOL deviceClean;
 @end
 
-@implementation RASPGuard
+/*
+ * The verdict is written by the launch checks, the periodic sweep, the recovery re-check and the
+ * pinning delegate - four different threads - and read from every protected operation the host
+ * performs. Synthesised accessors, atomic or not, cannot make `mask |= FLAG` safe either: that is
+ * a read, a modify and a write, and a sweep landing between them drops the flag. Explicit atomics
+ * throughout, with a fetch_or for the flag case.
+ */
+@implementation RASPGuard {
+    _Atomic(uint32_t) _atomicThreatMask;
+    _Atomic(bool) _atomicDeviceClean;
+}
+
+- (uint32_t)lastThreatMask { return atomic_load(&_atomicThreatMask); }
+- (void)setLastThreatMask:(uint32_t)mask { atomic_store(&_atomicThreatMask, mask); }
+- (BOOL)deviceClean { return atomic_load(&_atomicDeviceClean) ? YES : NO; }
+- (void)setDeviceClean:(BOOL)clean { atomic_store(&_atomicDeviceClean, clean ? true : false); }
+
+/// Adds a flag without losing one a concurrent writer set at the same moment.
+- (void)raiseThreatFlag:(uint32_t)flag {
+    atomic_fetch_or(&_atomicThreatMask, flag);
+    atomic_store(&_atomicDeviceClean, false);
+}
 
 + (instancetype)sharedGuard {
     static RASPGuard *instance = nil;
@@ -73,8 +89,10 @@ static os_log_t _rasp_log(void) {
     self = [super init];
     if (self) {
         _monitoringInterval = 30.0;
-        _lastThreatMask = RASP_THREAT_NONE;
-        _deviceClean = YES;
+        atomic_store(&_atomicThreatMask, RASP_THREAT_NONE);
+        atomic_store(&_atomicDeviceClean, true);
+        _additionalPinsByHost = @{};
+        _hostPinFloor = @{};
     }
     return self;
 }
@@ -100,22 +118,45 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     guard.deviceClean = (threats == RASP_THREAT_NONE);
 
     if (threats != RASP_THREAT_NONE) {
-        // Gunakan os_log private: nilai tidak terbaca di Console.app tanpa entitlement khusus
         os_log_with_type(_rasp_log(), OS_LOG_TYPE_ERROR,
                          "Threats detected at launch: %{private}u", threats);
+        // At .regular the finding is recorded and left to the host's own SecurityShield policy,
+        // which the service configures. .hsa and .middle end the session over it.
+        if ([NXSecurityPolicy revokesOnRuntimeThreat]) {
+            [[SessionManager sharedManager] clearAll];
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"io.nexilis.zta.runtimeCompromise"
+                                                                object:nil
+                                                              userInfo:@{@"threat_mask": @(threats)}];
+            // Without this a launch-time finding is a life sentence. The return below skips the
+            // progression that arms the periodic sweep, so nothing ever re-runs the checks:
+            // deviceClean stays NO for the life of the process, and at modes 1 and 2 that means
+            // every protected call is refused until the app is killed - including long after a
+            // false positive has gone away. Mode 3 is left exactly as it was: it does not consult
+            // deviceClean for authorization, so it has nothing to recover.
+            [guard startRecoveryReevaluation];
+        }
         return;
     }
 
-    // Status FE 11 — Code Signature & Tamper Verification. Only reachable if
-    // the full native chain above completed (GlobalState == 10).
-    if (stateGet() != NX_STATE_NATIVE_GOT_HOOK_CHECK || ![guard verifyCodeSignatureIntegrity]) {
-        guard.lastThreatMask |= RASP_THREAT_TAMPERED;
-        guard.deviceClean = NO;
-        os_log_with_type(_rasp_log(), OS_LOG_TYPE_ERROR,
-                         "Entitlement/signature mismatch at launch");
+    // Status FE 11 — Native chain is complete. If compile-time identity expectations are
+    // supplied, verify them pre-main; otherwise APISZTA configures and verifies the identity
+    // before any authorization can be issued.
+    if (stateGet() != NX_STATE_NATIVE_GOT_HOOK_CHECK) {
+        [guard raiseThreatFlag:RASP_THREAT_TAMPERED];
         return;
     }
-    stateSet(NX_STATE_CODE_SIGNATURE_VERIFY); // -> 11
+#if defined(NEXILIS_EXPECTED_BUNDLE_ID) && defined(NEXILIS_EXPECTED_APP_ID) && defined(NEXILIS_EXPECTED_TEAM_ID) && defined(NEXILIS_EXPECTED_APPATTEST_ENV)
+    [guard configureExpectedBundleID:@NEXILIS_EXPECTED_BUNDLE_ID
+                       applicationID:@NEXILIS_EXPECTED_APP_ID
+                              teamID:@NEXILIS_EXPECTED_TEAM_ID
+                appAttestEnvironment:@NEXILIS_EXPECTED_APPATTEST_ENV];
+    if (![guard verifyCodeSignatureIntegrity]) {
+        [guard raiseThreatFlag:RASP_THREAT_TAMPERED];
+        os_log_with_type(_rasp_log(), OS_LOG_TYPE_ERROR, "Entitlement/signature mismatch at launch");
+        return;
+    }
+#endif
+    stateSet(NX_STATE_CODE_SIGNATURE_VERIFY); // -> 11; runtime identity gate still runs in APISZTA
 
     // Status FE 12 — fail-closed path is now armed for the remainder of launch.
     stateSet(NX_STATE_FAIL_CLOSED_READY); // -> 12
@@ -127,6 +168,57 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     // the same way once wired in.)
     [guard startMonitoring];
     stateSet(NX_STATE_PERIODIC_MONITORING); // -> 15
+}
+
+/// Re-evaluates a launch-time finding until it clears.
+///
+/// It deliberately does NOT run the response path. Revoking, notifying and terminating belong to
+/// a finding that appears during a session that was previously clean; here there is no session to
+/// revoke, and a device that is still dirty has not got worse. Running the response path from
+/// here would turn "mode 1 refuses to authorize on this device" into "mode 1 aborts the process
+/// 30 seconds after launch", which is a crash where today there is none.
+///
+/// When the device does read clean it completes the flow-state progression the launch path
+/// skipped - AppAttestService refuses to configure below NX_STATE_PERIODIC_MONITORING, so
+/// clearing deviceClean alone would not be enough to let the chain start - hands over to the
+/// normal sweep, and stops itself.
+- (void)startRecoveryReevaluation {
+    if (self.recoveryTimer != nil || self.monitorTimer != nil) return;
+
+    dispatch_queue_t queue = dispatch_queue_create("io.nexilis.zta.rasp.recovery", DISPATCH_QUEUE_SERIAL);
+    self.recoveryTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    if (self.recoveryTimer == nil) return;
+
+    uint64_t interval = (uint64_t)(self.monitoringInterval * NSEC_PER_SEC);
+    dispatch_source_set_timer(self.recoveryTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval),
+                              interval,
+                              (uint64_t)(1 * NSEC_PER_SEC));
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(self.recoveryTimer, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        uint32_t threats = rasp_run_all_checks();
+        strongSelf.lastThreatMask = threats;
+        strongSelf.deviceClean = (threats == RASP_THREAT_NONE);
+        if (threats != RASP_THREAT_NONE) return;
+
+        os_log_with_type(_rasp_log(), OS_LOG_TYPE_INFO, "Launch-time finding cleared on re-check");
+        if (stateGet() == NX_STATE_NATIVE_GOT_HOOK_CHECK) {
+            stateSet(NX_STATE_CODE_SIGNATURE_VERIFY); // -> 11
+            stateSet(NX_STATE_FAIL_CLOSED_READY);     // -> 12
+        }
+
+        dispatch_source_t done = strongSelf.recoveryTimer;
+        strongSelf.recoveryTimer = nil;
+        if (done != nil) dispatch_source_cancel(done);
+
+        [strongSelf startMonitoring];
+        stateSet(NX_STATE_PERIODIC_MONITORING);       // -> 15
+    });
+    dispatch_resume(self.recoveryTimer);
 }
 
 - (void)startMonitoring {
@@ -156,9 +248,18 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
             os_log_with_type(_rasp_log(), OS_LOG_TYPE_INFO,
                              "Periodic check: anomaly detected");
 
-            // 2. Notifikasi delegate — delegate WAJIB kirim signal ke server
-            //    Server yang memutuskan: step-up auth, limit transaksi, atau degraded session
-            //    dengan delay agar tidak bisa ditelusuri ke branch ini
+            // At .hsa and .middle this is mandatory local enforcement: a compromised process
+            // loses its ZTA token immediately, and the host observes the same notification and
+            // stops protected operations. At .regular the delegate below is still told, and the
+            // server still decides - the session is not torn down from here.
+            if ([NXSecurityPolicy revokesOnRuntimeThreat]) {
+                [[SessionManager sharedManager] clearAll];
+                [[NSNotificationCenter defaultCenter] postNotificationName:@"io.nexilis.zta.runtimeCompromise"
+                                                                    object:nil
+                                                                  userInfo:@{@"threat_mask": @(threats)}];
+            }
+
+            // 2. Notify delegate for server-side revocation/telemetry as well.
             if ([strongSelf.delegate respondsToSelector:@selector(raspGuard:didDetectThreats:)]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [strongSelf.delegate raspGuard:strongSelf didDetectThreats:threats];
@@ -172,9 +273,12 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
             //    Untuk app yang belum punya server-side adjudication,
             //    aktifkan NEXILIS_RASP_TERMINATE_ON_THREAT sementara.
 #if NEXILIS_RASP_TERMINATE_ON_THREAT
-            if (![strongSelf.delegate respondsToSelector:@selector(raspGuard:didDetectThreats:)]) {
-                // Same generic alert format as the boot-sequence failures,
-                // using the Periodic RASP Monitoring row's errcode (Status FE 15).
+            // Terminating the process is .hsa alone. .middle has already lost its token above,
+            // which is what stops protected work there.
+            if ([NXSecurityPolicy terminatesOnUnhandledThreat] &&
+                ![strongSelf.delegate respondsToSelector:@selector(raspGuard:didDetectThreats:)]) {
+                os_log_with_type(_rasp_log(), OS_LOG_TYPE_FAULT, "No RASP response delegate; terminating compromised process");
+                abort();
             }
 #endif
         }
@@ -188,6 +292,12 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
         dispatch_source_cancel(self.monitorTimer);
         self.monitorTimer = nil;
     }
+    // The recovery re-check is the same kind of timer and has to go the same way; leaving it
+    // running would keep re-arming the sweep this call was made to stop.
+    if (self.recoveryTimer != nil) {
+        dispatch_source_cancel(self.recoveryTimer);
+        self.recoveryTimer = nil;
+    }
 }
 
 - (uint32_t)runChecksNow {
@@ -197,76 +307,87 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     return threats;
 }
 
+- (void)configureExpectedBundleID:(NSString *)bundleID
+                     applicationID:(NSString *)applicationID
+                            teamID:(NSString *)teamID
+              appAttestEnvironment:(NSString *)environment {
+    self.expectedBundleID = [bundleID copy];
+    self.expectedApplicationID = [applicationID copy];
+    self.expectedTeamID = [teamID copy];
+    self.expectedAppAttestEnvironment = [environment copy];
+}
+
+- (BOOL)releaseIdentityConfigured {
+    return self.expectedBundleID.length > 0 && self.expectedApplicationID.length > 0 &&
+           self.expectedTeamID.length > 0 && self.expectedAppAttestEnvironment.length > 0;
+}
+
 - (BOOL)verifyCodeSignatureIntegrity {
-    BOOL ok = YES;
+    // v2.0.1: use public, App-Store-safe local checks only. SecTask* entitlement
+    // introspection is intentionally not used on iOS. Cryptographic verification of
+    // the real application identity (Team ID / bundle ID / App Attest environment)
+    // is performed by the server when it verifies the mandatory App Attest object.
+    // .hsa refuses to answer YES for an identity it was never given - that is the fail-closed
+    // half of NX-08. .middle and .regular do not require the expectation at all, so an absent
+    // one is simply nothing to compare, not a tamper finding. SecurityShield's isTempering()
+    // reads this same verdict.
+    if (![self releaseIdentityConfigured]) return ![NXSecurityPolicy isHSA];
 
-#ifdef NEXILIS_EXPECTED_BUNDLE_ID
-    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    ok = ok && [bundleId isEqualToString:@NEXILIS_EXPECTED_BUNDLE_ID];
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *bundleId = bundle.bundleIdentifier ?: @"";
+    if (![bundleId isEqualToString:self.expectedBundleID]) return NO;
+
+    // The configured application identifier must be internally consistent. This
+    // catches release misconfiguration locally before any protected session starts.
+    NSString *derivedApplicationID = [NSString stringWithFormat:@"%@.%@",
+                                      self.expectedTeamID, self.expectedBundleID];
+    if (![self.expectedApplicationID isEqualToString:derivedApplicationID]) return NO;
+
+    NSString *environment = self.expectedAppAttestEnvironment.lowercaseString;
+#if DEBUG
+    if (!([environment isEqualToString:@"development"] ||
+          [environment isEqualToString:@"production"])) return NO;
+#else
+    // Hardened production releases must use the production App Attest environment.
+    if (![environment isEqualToString:@"production"]) return NO;
 #endif
 
-#ifdef NEXILIS_EXPECTED_APP_ID
-    CFErrorRef appIdError = NULL;
-    CFTypeRef appIdValue = SecTaskCopyValueForEntitlement(task,
-                                                          CFSTR("application-identifier"),
-                                                          &appIdError);
-    if (appIdValue == NULL || CFGetTypeID(appIdValue) != CFStringGetTypeID()) {
-        ok = NO;
-    } else {
-        NSString *actual = (__bridge NSString *)appIdValue;
-        ok = ok && [actual isEqualToString:@NEXILIS_EXPECTED_APP_ID];
-    }
-    if (appIdValue) CFRelease(appIdValue);
-    if (appIdError) CFRelease(appIdError);
-#endif
+    // Sanity-check that the running executable is the executable of the main bundle.
+    // This is not used as a substitute for code-signing/App Attest verification; it
+    // is a local fail-closed consistency check using public Foundation APIs.
+    NSURL *bundleURL = bundle.bundleURL.URLByStandardizingPath;
+    NSURL *executableURL = bundle.executableURL.URLByStandardizingPath;
+    if (bundleURL == nil || executableURL == nil) return NO;
+    NSString *bundlePath = bundleURL.path.stringByStandardizingPath;
+    NSString *executablePath = executableURL.path.stringByStandardizingPath;
+    NSString *bundlePrefix = [bundlePath stringByAppendingString:@"/"];
+    if (![executablePath hasPrefix:bundlePrefix]) return NO;
 
-#ifdef NEXILIS_EXPECTED_TEAM_ID
-    CFErrorRef teamError = NULL;
-    CFTypeRef teamValue = SecTaskCopyValueForEntitlement(task,
-                                                         CFSTR("com.apple.developer.team-identifier"),
-                                                         &teamError);
-    if (teamValue == NULL || CFGetTypeID(teamValue) != CFStringGetTypeID()) {
-        ok = NO;
-    } else {
-        NSString *actual = (__bridge NSString *)teamValue;
-        ok = ok && [actual isEqualToString:@NEXILIS_EXPECTED_TEAM_ID];
-    }
-    if (teamValue) CFRelease(teamValue);
-    if (teamError) CFRelease(teamError);
-#endif
-
-#ifdef NEXILIS_EXPECTED_APPATTEST_ENV
-    CFErrorRef envError = NULL;
-    CFTypeRef envValue = SecTaskCopyValueForEntitlement(task,
-                                                        CFSTR("com.apple.developer.devicecheck.appattest-environment"),
-                                                        &envError);
-    if (envValue == NULL || CFGetTypeID(envValue) != CFStringGetTypeID()) {
-        ok = NO;
-    } else {
-        NSString *actual = (__bridge NSString *)envValue;
-        ok = ok && [actual isEqualToString:@NEXILIS_EXPECTED_APPATTEST_ENV];
-    }
-    if (envValue) CFRelease(envValue);
-    if (envError) CFRelease(envError);
-#endif
-
-#ifdef NEXILIS_EXPECTED_EXECUTABLE_SHA256
-    NSString *executablePath = [[NSBundle mainBundle] executablePath];
-    NSData *executableData = executablePath.length > 0 ? [NSData dataWithContentsOfFile:executablePath options:NSDataReadingMappedIfSafe error:nil] : nil;
-    NSString *actualExecutableHash = nx_sha256_hex_for_data(executableData);
-    if (actualExecutableHash.length == 0) {
-        ok = NO;
-    } else {
-        ok = ok && [actualExecutableHash caseInsensitiveCompare:@NEXILIS_EXPECTED_EXECUTABLE_SHA256] == NSOrderedSame;
-    }
-#endif
-
-    return ok;
+    return YES;
 }
 
 - (void)configurePinningWithPrimaryPin:(NSString *)primaryPin backupPin:(NSString *)backupPin {
     self.primaryPin = [primaryPin copy];
     self.backupPin = [backupPin copy];
+}
+
+- (BOOL)pinningConfigured {
+    return self.primaryPin.length > 0 && self.backupPin.length > 0 && ![self.primaryPin isEqualToString:self.backupPin];
+}
+
+- (void)configureHostPinFloor:(NSDictionary<NSString *, NSArray<NSString *> *> *)pinsByHost {
+    NSMutableDictionary *lowercased = [NSMutableDictionary dictionaryWithCapacity:pinsByHost.count];
+    [pinsByHost enumerateKeysAndObjectsUsingBlock:^(NSString *host, NSArray<NSString *> *pins, BOOL *stop) {
+        if (host.length > 0 && pins.count > 0) lowercased[host.lowercaseString] = [pins copy];
+    }];
+    self.hostPinFloor = [lowercased copy];
+}
+
+- (void)configureAdditionalPins:(NSArray<NSString *> *)pins forHost:(NSString *)host {
+    if (host.length == 0) return;
+    NSMutableDictionary *next = [self.additionalPinsByHost mutableCopy] ?: [NSMutableDictionary dictionary];
+    next[host.lowercaseString] = [pins copy] ?: @[];
+    self.additionalPinsByHost = [next copy];
 }
 
 // A.2 — reusable pinning API (used by PinnedURLSessionDelegate)
@@ -296,18 +417,34 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     NSString *serverPin = [NSString stringWithFormat:@"sha256/%@",
                            [hashData base64EncodedStringWithOptions:0]];
 
-    // A.3 — store for channel-binding in AppAttestManager
-    self.lastPinnedLeafSPKIHex = serverPin;
-
-    return (self.primaryPin.length > 0 && [serverPin isEqualToString:self.primaryPin])
-        || (self.backupPin.length  > 0 && [serverPin isEqualToString:self.backupPin]);
+    BOOL matched = (self.primaryPin.length > 0 && [serverPin isEqualToString:self.primaryPin]) ||
+                   (self.backupPin.length > 0 && [serverPin isEqualToString:self.backupPin]) ||
+                   [self.additionalPinsByHost[host.lowercaseString] containsObject:serverPin] ||
+                   [self.hostPinFloor[host.lowercaseString] containsObject:serverPin];
+    // A.3 — channel binding is updated only after a successful pin match. A rejected
+    // attacker certificate must never become the binding consumed by a concurrent request.
+    if (matched) self.lastPinnedLeafSPKIHex = serverPin;
+    return matched;
 }
 
 - (void)reportPinningFailureForHost:(NSString *)host {
     os_log_with_type(_rasp_log(), OS_LOG_TYPE_ERROR,
                      "Certificate pinning failure for host: %{private}@", host);
-    // Signal ke delegate → server adjudication
-    self.lastThreatMask |= RASP_THREAT_TAMPERED;
+    // The connection itself is already refused by the caller at every mode. What differs is the
+    // blast radius: .hsa and .middle treat a first-party pin mismatch as a compromised process
+    // and revoke, .regular reports it and leaves the session alone.
+    if ([NXSecurityPolicy revokesOnRuntimeThreat]) {
+        [self raiseThreatFlag:RASP_THREAT_TAMPERED];
+        [[SessionManager sharedManager] clearAll];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"io.nexilis.zta.runtimeCompromise"
+                                                            object:nil
+                                                          userInfo:@{@"threat_mask": @(RASP_THREAT_TAMPERED)}];
+    }
+    if ([self.delegate respondsToSelector:@selector(raspGuard:didDetectPinningFailureForHost:)]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.delegate raspGuard:self didDetectPinningFailureForHost:host ?: @"<unknown>"];
+        });
+    }
     if ([self.delegate respondsToSelector:@selector(raspGuard:didDetectThreats:)]) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.delegate raspGuard:self didDetectThreats:RASP_THREAT_TAMPERED];
@@ -440,53 +577,24 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
 #pragma clang diagnostic pop
     }
 
-#if NEXILIS_APPSTORE_BUILD && !defined(NEXILIS_ALLOW_INSECURE_RELEASE)
-    if (self.primaryPin.length == 0 && self.backupPin.length == 0) {
-        if ([self.delegate respondsToSelector:@selector(raspGuard:didDetectPinningFailureForHost:)]) {
-            NSString *host = challenge.protectionSpace.host ?: @"<unknown>";
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self.delegate raspGuard:self didDetectPinningFailureForHost:host];
-            });
-        }
-        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
-        return;
-    }
-#else
-    if (self.primaryPin.length == 0 && self.backupPin.length == 0) {
-        completionHandler(NSURLSessionAuthChallengeUseCredential,
-                          [NSURLCredential credentialForTrust:serverTrust]);
-        return;
-    }
-#endif
-
-    SecKeyRef serverKey = SecTrustCopyKey(serverTrust);
-    NSData *spki = nx_spki_for_key(serverKey);
-    if (serverKey != NULL) CFRelease(serverKey);
-    if (spki == nil) {
-        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
-        return;
-    }
-
-    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(spki.bytes, (CC_LONG)spki.length, hash);
-    NSData *hashData = [NSData dataWithBytes:hash length:CC_SHA256_DIGEST_LENGTH];
-    NSString *serverPin = [NSString stringWithFormat:@"sha256/%@", [hashData base64EncodedStringWithOptions:0]];
-
-    BOOL pinMatch = (self.primaryPin.length > 0 && [serverPin isEqualToString:self.primaryPin]) ||
-                    (self.backupPin.length > 0 && [serverPin isEqualToString:self.backupPin]);
-    if (pinMatch) {
+    NSString *host = challenge.protectionSpace.host ?: @"";
+    if (![self isPinnedHost:host]) {
         completionHandler(NSURLSessionAuthChallengeUseCredential,
                           [NSURLCredential credentialForTrust:serverTrust]);
         return;
     }
 
-    if ([self.delegate respondsToSelector:@selector(raspGuard:didDetectPinningFailureForHost:)]) {
-        NSString *host = challenge.protectionSpace.host ?: @"<unknown>";
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self.delegate raspGuard:self didDetectPinningFailureForHost:host];
-        });
+    // First-party/ZTA hosts are always fail-closed. Primary + independent backup form
+    // the immutable floor; PinSetStore feeds only signature-verified additive pins into
+    // additionalPinsByHost. No build mode may silently downgrade this to system trust.
+    if (![self serverTrust:serverTrust matchesPinnedSPKIForHost:host]) {
+        [self reportPinningFailureForHost:host];
+        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+        return;
     }
-    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+
+    completionHandler(NSURLSessionAuthChallengeUseCredential,
+                      [NSURLCredential credentialForTrust:serverTrust]);
 }
 
 - (void)dealloc {

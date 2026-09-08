@@ -5,6 +5,7 @@
 
 #import "AppAttestManager.h"
 #import "RASPGuard.h"
+#import "NXSecurityPolicy.h"
 #import "SessionManager.h"
 #import <DeviceCheck/DeviceCheck.h>
 #import <Security/Security.h>
@@ -239,6 +240,7 @@ static NSString *NXDeviceModel(void) {
     if (self) {
         _storedKeyId = [self loadStringFromKeychain:kKeychainKeyIdKey account:@"nexilis_attest"];
         _session = [[RASPGuard sharedGuard] pinnedURLSession];
+        _minimumOSMajor = 14; // where App Attest begins; overridden from the configuration
     }
     return self;
 }
@@ -262,7 +264,10 @@ static NSString *NXDeviceModel(void) {
 }
 
 - (BOOL)isSupported {
-    if (@available(iOS 16.0, *)) {
+    if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion < self.minimumOSMajor) {
+        return NO;
+    }
+    if (@available(iOS 14.0, *)) {
         return [DCAppAttestService sharedService].isSupported;
     }
     return NO;
@@ -557,12 +562,17 @@ static NSString *NXDeviceModel(void) {
     }] resume];
 }
 
+static NSString *NXCurrentChannelBinding(void) {
+    NSString *pin = [RASPGuard sharedGuard].lastPinnedLeafSPKIHex;
+    return pin.length > 0 ? pin : nil;
+}
+
 #pragma mark - Registration / delivery-key synchronization
 
 - (void)registerDeviceWithCompletion:(NXAttestRegistrationCompletion)completion {
     if (!self.isSupported) {
         completion(NO, NXError(NXAppAttestErrorNotSupported,
-                               @"App Attest is not supported on this device (requires Secure Enclave and iOS 16+)"));
+                               [NSString stringWithFormat:@"App Attest is not supported here (requires an App Attest-capable Secure Enclave and iOS %ld+)", (long)self.minimumOSMajor]));
         return;
     }
 
@@ -579,7 +589,7 @@ static NSString *NXDeviceModel(void) {
     }
     NSString *deliveryFingerprint = [self deliveryKeyFingerprintFromPublicKey:deliveryPubKey];
 
-    if (@available(iOS 16.0, *)) {
+    if (@available(iOS 14.0, *)) {
         DCAppAttestService *service = [DCAppAttestService sharedService];
         [service generateKeyWithCompletionHandler:^(NSString * _Nullable keyId, NSError * _Nullable error) {
             if (error != nil || keyId.length == 0) {
@@ -600,7 +610,16 @@ static NSString *NXDeviceModel(void) {
                         return;
                     }
 
-                    NSDictionary *body = @{
+                    // .hsa and .middle will not attest over a channel they have not pinned.
+                    // .regular may legitimately have none - a host pointing at its own domain,
+                    // which isPinnedHost does not cover - so it binds when it can and goes on
+                    // when it cannot, rather than refusing to register at all.
+                    NSString *channelBinding = NXCurrentChannelBinding();
+                    if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
+                        completion(NO, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during registration"));
+                        return;
+                    }
+                    NSMutableDictionary *body = [@{
                         @"attestation_object": NXBase64(attestationObject),
                         @"key_id": keyId,
                         @"nonce_id": nonceId,
@@ -608,7 +627,24 @@ static NSString *NXDeviceModel(void) {
                         @"os_version": [[UIDevice currentDevice] systemVersion] ?: @"<unknown>",
                         @"device_model": NXDeviceModel(),
                         @"bundle_id": [[NSBundle mainBundle] bundleIdentifier] ?: @"<unknown>",
-                    };
+                    } mutableCopy];
+                    // v2.0.1: channel binding is a mandatory precondition and is appended only
+                    // after the non-empty guard above. This avoids ever constructing an
+                    // NSDictionary literal with a nullable value.
+                    if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
+
+            // Sent at every mode. The decision endpoint refuses a transaction whose approval key
+            // it never recorded, so withholding this at mode 3 was what made sensitive
+            // transactions impossible there - and mode 3 is the default, which is to say most of
+            // the installed base. The server has always recorded this field only when a client
+            // sends one, so adding it does not break a client that still does not.
+            //
+            // Additive, and it degrades rather than fails: `approvalPublicKeyBase64` creates the
+            // Secure Enclave key with `prompt:nil` and derives only the public half, so no
+            // biometric prompt appears during registration, and a device that cannot create a
+            // biometry-bound key returns nil and simply omits the field.
+            NSString *approvalKey = [self approvalPublicKeyBase64];
+            if (approvalKey.length > 0) body[@"approval_public_key_b64"] = approvalKey;
                     [self POSTJSONBody:body endpoint:self.attestEndpoint completion:^(NSDictionary * _Nullable json, NSHTTPURLResponse * _Nullable response, NSError * _Nullable networkError) {
                         if (networkError != nil) {
                             completion(NO, networkError);
@@ -628,7 +664,7 @@ static NSString *NXDeviceModel(void) {
             }];
         }];
     } else {
-        completion(NO, NXError(NXAppAttestErrorNotSupported, @"App Attest requires iOS 16 or later"));
+        completion(NO, NXError(NXAppAttestErrorNotSupported, @"App Attest requires iOS 14 or later"));
     }
 }
 
@@ -680,6 +716,12 @@ static NSString *NXDeviceModel(void) {
         body[@"device_model"] = NXDeviceModel();
         body[@"bundle_id"] = [[NSBundle mainBundle] bundleIdentifier] ?: @"<unknown>";
         body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
+        NSString *channelBinding = NXCurrentChannelBinding();
+        if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
+            completion(NO, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during delivery-key registration"));
+            return;
+        }
+        if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
 
         NSError *canonicalError = nil;
         NSData *canonical = NXCanonicalJSONData(body, &canonicalError);
@@ -720,7 +762,7 @@ static NSString *NXDeviceModel(void) {
         completion(nil, NXError(NXAppAttestErrorKeyNotRegistered, @"Device not registered with App Attest"));
         return;
     }
-    if (@available(iOS 16.0, *)) {
+    if (@available(iOS 14.0, *)) {
         NSData *clientDataHash = NXSHA256(clientData);
         [[DCAppAttestService sharedService] generateAssertion:self.storedKeyId
                                       clientDataHash:clientDataHash
@@ -732,7 +774,7 @@ static NSString *NXDeviceModel(void) {
             completion(assertion, nil);
         }];
     } else {
-        completion(nil, NXError(NXAppAttestErrorNotSupported, @"App Attest requires iOS 16 or later"));
+        completion(nil, NXError(NXAppAttestErrorNotSupported, @"App Attest requires iOS 14 or later"));
     }
 }
 
@@ -767,6 +809,12 @@ static NSString *NXDeviceModel(void) {
             body[@"device_posture"] = devicePosture ?: @{};
             body[@"os_version"] = [[UIDevice currentDevice] systemVersion] ?: @"<unknown>";
             body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
+            NSString *channelBinding = NXCurrentChannelBinding();
+            if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
+                completion(nil, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during key delivery"));
+                return;
+            }
+            if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
 
             NSError *canonicalError = nil;
             NSData *canonical = NXCanonicalJSONData(body, &canonicalError);
@@ -923,6 +971,28 @@ static NSString *NXDeviceModel(void) {
 
 #pragma mark - Transaction signing
 
+- (NSString *)approvalPublicKeyBase64 {
+    NSError *loadError = nil;
+    SecKeyRef privateKey = [self loadSigningKeyWithPrompt:nil createIfMissing:YES error:&loadError];
+    if (privateKey == NULL) return nil;
+
+    SecKeyRef publicKey = SecKeyCopyPublicKey(privateKey);
+    CFRelease(privateKey);
+    if (publicKey == NULL) return nil;
+
+    CFErrorRef exportError = NULL;
+    CFDataRef external = SecKeyCopyExternalRepresentation(publicKey, &exportError);
+    CFRelease(publicKey);
+    if (external == NULL) {
+        if (exportError) CFRelease(exportError);
+        return nil;
+    }
+    NSData *raw = CFBridgingRelease(external);
+    // 0x04 || X || Y. Anything else is not the uncompressed P-256 point the server will parse.
+    if (raw.length != 65 || ((const uint8_t *)raw.bytes)[0] != 0x04) return nil;
+    return NXBase64(raw);
+}
+
 - (void)signTransactionData:(NSData *)data
                  completion:(void (^)(NSData * _Nullable signature, NSError * _Nullable error))completion {
     NSError *loadError = nil;
@@ -974,6 +1044,8 @@ static NSString *NXDeviceModel(void) {
         body[@"challenge"] = NXBase64(nonce);
         body[@"reason"] = @"client_clear_registration";
         body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
+        NSString *channelBinding = NXCurrentChannelBinding();
+        if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
 
         NSError *canonicalError = nil;
         NSData *canonical = NXCanonicalJSONData(body, &canonicalError);
@@ -1008,6 +1080,79 @@ static NSString *NXDeviceModel(void) {
             }];
         }];
     }];
+}
+
+- (void)verifySessionStatusWithAuditHead:(NSString *)auditHead
+                              completion:(void (^)(NSDictionary * _Nullable, NSError * _Nullable))completion {
+    if (self.storedKeyId.length == 0) {
+        completion(nil, NXError(NXAppAttestErrorKeyNotRegistered, @"Device not registered with App Attest"));
+        return;
+    }
+    if (self.statusVerifyEndpoint.length == 0) {
+        completion(nil, NXError(NXAppAttestErrorNotSupported, @"Status endpoint is not configured"));
+        return;
+    }
+    NSString *sessionToken = [[SessionManager sharedManager] validSessionToken];
+    if (sessionToken.length == 0) {
+        completion(nil, NXError(NXAppAttestErrorKeyNotRegistered, @"No live session to verify"));
+        return;
+    }
+
+    [self requestChallengeForPurpose:@"status" completion:^(NSData * _Nullable nonce, NSString * _Nullable nonceId, NSError * _Nullable challengeError) {
+        if (challengeError != nil || nonce == nil || nonceId.length == 0) {
+            completion(nil, challengeError ?: NXError(NXAppAttestErrorNonceExpired, @"Unable to obtain status challenge"));
+            return;
+        }
+
+        NSMutableDictionary *body = [NSMutableDictionary dictionary];
+        body[@"key_id"] = self.storedKeyId;
+        body[@"nonce_id"] = nonceId;
+        body[@"challenge"] = NXBase64(nonce);
+        body[@"session_token"] = sessionToken;
+        body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
+        if (auditHead.length > 0) body[@"audit_chain_head"] = auditHead;
+        body[@"device_posture"] = @{
+            @"threat_mask": @([RASPGuard sharedGuard].lastThreatMask),
+            @"rasp_clean": @([RASPGuard sharedGuard].deviceClean),
+            @"os_version": [[UIDevice currentDevice] systemVersion] ?: @"<unknown>",
+            @"device_model": NXDeviceModel(),
+        };
+        NSString *channelBinding = NXCurrentChannelBinding();
+        if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
+            completion(nil, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during status verify"));
+            return;
+        }
+        if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
+
+        NSError *canonicalError = nil;
+        NSData *canonical = NXCanonicalJSONData(body, &canonicalError);
+        if (canonical == nil) {
+            completion(nil, canonicalError ?: NXError(NXAppAttestErrorDecodeFailed, @"Unable to canonicalize status body"));
+            return;
+        }
+
+        [self generateAssertionForClientData:canonical completion:^(NSData * _Nullable assertion, NSError * _Nullable assertError) {
+            if (assertion == nil) {
+                completion(nil, assertError ?: NXError(NXAppAttestErrorAssertFailed, @"Status assertion failed"));
+                return;
+            }
+            NSMutableDictionary *finalBody = [body mutableCopy];
+            finalBody[@"assertion"] = NXBase64(assertion);
+            [self POSTJSONBody:finalBody endpoint:self.statusVerifyEndpoint completion:^(NSDictionary * _Nullable json, NSHTTPURLResponse * _Nullable response, NSError * _Nullable networkError) {
+                if (networkError != nil) { completion(nil, networkError); return; }
+                if (response.statusCode < 200 || response.statusCode >= 300) {
+                    completion(nil, NXServerError(response.statusCode, json[@"error"] ?: @"Status verification refused"));
+                    return;
+                }
+                completion(json, nil);
+            }];
+        }];
+    }];
+}
+
+- (void)clearLocalRegistrationImmediately {
+    NSString *keyId = [self.storedKeyId copy];
+    [self clearLocalRegistrationStateForKeyId:keyId];
 }
 
 - (void)clearLocalRegistrationStateForKeyId:(NSString *)keyId {
