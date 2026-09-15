@@ -26,6 +26,7 @@ extern NSString *NXEncryptedRevokeEndpoint(void);
 extern NSString *NXEncryptedPrimaryPin(void);
 extern NSString *NXEncryptedBackupPin(void);
 extern NSString *NXEncryptedNewUniversePin(void);
+extern NSString *NXEncryptedPinRotationSignerSPKI(void);
 
 // P2 — App API key  [baru: F1 fix]
 extern NSString *NXEncryptedAPIKey(void);

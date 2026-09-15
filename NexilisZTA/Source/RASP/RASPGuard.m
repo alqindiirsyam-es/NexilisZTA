@@ -20,6 +20,7 @@
 #import "SessionManager.h"
 #import "NXSecurityPolicy.h"
 #import <stdatomic.h>
+#import <os/lock.h>
 
 // Log channel khusus RASP — private agar tidak terbaca di Console.app tanpa entitlement
 static NSData *nx_spki_for_key(SecKeyRef key);
@@ -63,6 +64,14 @@ static os_log_t _rasp_log(void) {
 @implementation RASPGuard {
     _Atomic(uint32_t) _atomicThreatMask;
     _Atomic(bool) _atomicDeviceClean;
+    /*
+     * A.3 — one entry per pinned host, written from the TLS callback and read from whichever
+     * thread is about to build a request. URLSession runs that callback on a queue of its own and
+     * several can be in flight at once, so the map needs a lock; the critical section is a
+     * dictionary read or write and nothing else, which is what os_unfair_lock is for.
+     */
+    NSMutableDictionary<NSString *, NSString *> *_pinnedLeafSPKIByHost;
+    os_unfair_lock _channelBindingLock;
 }
 
 - (uint32_t)lastThreatMask { return atomic_load(&_atomicThreatMask); }
@@ -93,6 +102,8 @@ static os_log_t _rasp_log(void) {
         atomic_store(&_atomicDeviceClean, true);
         _additionalPinsByHost = @{};
         _hostPinFloor = @{};
+        _pinnedLeafSPKIByHost = [NSMutableDictionary dictionary];
+        _channelBindingLock = OS_UNFAIR_LOCK_INIT;
     }
     return self;
 }
@@ -423,8 +434,42 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
                    [self.hostPinFloor[host.lowercaseString] containsObject:serverPin];
     // A.3 — channel binding is updated only after a successful pin match. A rejected
     // attacker certificate must never become the binding consumed by a concurrent request.
-    if (matched) self.lastPinnedLeafSPKIHex = serverPin;
+    //
+    // Recorded against the host it belongs to. The single `lastPinnedLeafSPKIHex` below cannot be
+    // a binding on its own: this library pins the ZTA service and the operator domain, both are
+    // talked to throughout a session, and each connection overwrote the other's value - so a
+    // request that quoted it was as likely to be naming the channel it was not on. Keeping it
+    // costs nothing and hosts may already read it; the per-host map is what requests now quote.
+    if (matched) {
+        NSString *key = host.lowercaseString;
+        if (key.length > 0) {
+            os_unfair_lock_lock(&_channelBindingLock);
+            _pinnedLeafSPKIByHost[key] = serverPin;
+            os_unfair_lock_unlock(&_channelBindingLock);
+        }
+        self.lastPinnedLeafSPKIHex = serverPin;
+    }
     return matched;
+}
+
+- (NSString *)pinnedLeafSPKIForHost:(NSString *)host {
+    NSString *key = host.lowercaseString;
+    if (key.length == 0) return nil;
+    os_unfair_lock_lock(&_channelBindingLock);
+    NSString *pin = _pinnedLeafSPKIByHost[key];
+    os_unfair_lock_unlock(&_channelBindingLock);
+    return pin;
+}
+
+/// The same answer, for callers that hold the endpoint URL rather than its host.
+///
+/// A URL that will not parse, or one with no host, yields nil rather than a guess. Nil is a state
+/// the callers already handle - at app modes 1 and 2 it stops the request, which is the correct
+/// outcome for a request whose channel cannot be named.
+- (NSString *)pinnedLeafSPKIForEndpoint:(NSString *)endpoint {
+    if (endpoint.length == 0) return nil;
+    NSString *host = [NSURL URLWithString:endpoint].host;
+    return host.length > 0 ? [self pinnedLeafSPKIForHost:host] : nil;
 }
 
 - (void)reportPinningFailureForHost:(NSString *)host {

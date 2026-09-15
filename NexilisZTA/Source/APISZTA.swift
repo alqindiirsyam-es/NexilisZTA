@@ -127,6 +127,22 @@ public enum APISZTA {
     private static var generation = 0
     /// How long a single chain is given before its in-flight flag is released.
     private static let chainWatchdog: TimeInterval = 45
+    /// How many times key delivery alone is sent again before the App Attest registration is
+    /// thrown away and rebuilt.
+    ///
+    /// Key delivery is the last of five round trips, and it used to be the one whose failure cost
+    /// the device its Secure Enclave key: one miss cleared the registration and started over from
+    /// `attest`. Most of what fails there is not the registration - it is a radio that dropped
+    /// between the assertion and the POST - and discarding a good key to recover from a lost packet
+    /// is an expensive answer to a cheap problem. It also spends a fresh attestation against
+    /// Apple's per-device rate limit every time, on a device that had nothing wrong with it.
+    ///
+    /// Three tries, and the backoffs below are deliberately short: they have to fit inside
+    /// `chainWatchdog` above, not inside whatever the network feels like taking.
+    private static let keyDeliveryMaxTries = 3
+    /// Waits before the second and third key-delivery try. 3.0s of backoff in total, which leaves
+    /// the 45s chain budget to the round trips themselves.
+    private static let keyDeliveryBackoff: [TimeInterval] = [1.0, 2.0]
     /// Registered once, however many times `configure` is called.
     private static var observing = false
 
@@ -561,7 +577,11 @@ public enum APISZTA {
                                                      userInfo: [NSLocalizedDescriptionKey: "Sensitive challenge failed."])))
                 return
             }
-            let channel = RASPGuard.shared().lastPinnedLeafSPKIHex ?? ""
+            // The channel this decision request will travel, not whichever pinned host happened to
+            // connect last — see RASPGuard's channel-binding note. A sensitive decision that names
+            // the wrong channel is refused by a server that checks it, and means nothing on one
+            // that does not.
+            let channel = RASPGuard.shared().pinnedLeafSPKI(forEndpoint: decisionURL.absoluteString) ?? ""
             guard !channel.isEmpty else { failWith(6, "Pinned channel binding unavailable."); return }
 
             var body: [String: Any] = [
@@ -807,9 +827,23 @@ public enum APISZTA {
         // only block hosts without adding a check the backend does not already make.
         let hsa = NXSecurityPolicy.isHSA()
 
-        guard RASPGuard.shared().deviceClean, RASPGuard.shared().lastThreatMask == RASP_THREAT_NONE else {
-            fail(NSError(domain: NXAppAttestErrorDomain, code: Int(RASPGuard.shared().lastThreatMask),
-                         userInfo: [NSLocalizedDescriptionKey: "Runtime security posture is not clean."]))
+        let threatMask = RASPGuard.shared().lastThreatMask
+        guard RASPGuard.shared().deviceClean, threatMask == RASP_THREAT_NONE else {
+            // The mask is the diagnosis and the code already carries it, but the failure log
+            // prints only the description - so a finding at launch read as "not clean" with no
+            // way to tell jailbreak from a pin mismatch. Named in the text, bit by bit.
+            let names: [(UInt32, String)] = [
+                (UInt32(RASP_THREAT_JAILBREAK), "jailbreak"), (UInt32(RASP_THREAT_DEBUGGER), "debugger"),
+                (UInt32(RASP_THREAT_FRIDA), "frida"), (UInt32(RASP_THREAT_INJECTION), "injection"),
+                (UInt32(RASP_THREAT_SIMULATOR), "simulator"), (UInt32(RASP_THREAT_REVERSE_TOOL), "reverse-tool"),
+                (UInt32(RASP_THREAT_TAMPERED), "tampered"), (UInt32(RASP_THREAT_HOOK_DETECTED), "hook"),
+                (UInt32(RASP_THREAT_INLINE_HOOK), "inline-hook"), (UInt32(RASP_THREAT_GOT_HOOK), "got-hook"),
+            ]
+            let found = names.filter { threatMask & $0.0 != 0 }.map { $0.1 }
+            let detail = found.isEmpty ? "deviceClean=NO, mask=0" : found.joined(separator: ",")
+            fail(NSError(domain: NXAppAttestErrorDomain, code: Int(threatMask),
+                         userInfo: [NSLocalizedDescriptionKey:
+                                    "Runtime security posture is not clean (\(detail), mask 0x\(String(threatMask, radix: 16)))."]))
             return
         }
 
@@ -1018,17 +1052,183 @@ public enum APISZTA {
     private static func assertThenDeliverKey(attempt: Int = 0) {
         // requestKeyDelivery performs the nonce-bound App Attest assertion and sends it to the
         // server. We intentionally do not treat local assertion generation as a verified stage.
+        //
+        // `tries` starts over here, and that is the intended budget: a registration that was just
+        // rebuilt gets its own three transport retries. `attempt` is what stops the recursion -
+        // it is already 1 on that path, so the second exhaustion fails instead of rebuilding again.
         deliverKey(attempt: attempt)
     }
 
-    private static func deliverKey(attempt: Int = 0) {
+    /// Whether a failed key delivery is worth sending again over the same registration.
+    ///
+    /// Only a request that never got an answer is. A server that *answered* has adjudicated, and a
+    /// refusal is a decision - asking three more times does not change a decision, it only delays
+    /// the screen the reader is owed. `NXServerError` already draws that line for us
+    /// (AppAttestManager.m:74): 5xx, 408, 429 and an absent status arrive as `serverUnavailable`,
+    /// every other status as `serverRejected`. This reads that verdict rather than re-deriving it.
+    ///
+    /// TLS trust failures are deliberately absent, and that absence is most of what "make sure the
+    /// connection is safe" means here. A pin mismatch, an untrusted chain or a handshake the pinning
+    /// delegate cancelled is what somebody standing in the middle of the connection looks like. The
+    /// answer to that is to stop, not to offer them two more assertions.
+    private static func keyDeliveryWorthRetrying(_ error: Error?) -> Bool {
+        guard let error = error as NSError? else { return false }
+
+        if error.domain == NXAppAttestErrorDomain {
+            switch error.code {
+            case NXAppAttestError.serverUnavailable.rawValue,
+                 NXAppAttestError.networkFailed.rawValue,
+                 // A challenge that expired between the Secure Enclave assertion and the POST is
+                 // the signature of a slow link, not of a device with anything wrong with it - and
+                 // the next try fetches its own.
+                 NXAppAttestError.nonceExpired.rawValue:
+                return true
+            default:
+                // serverRejected, pinningFailed, assertFailed, cryptoFailed, decodeFailed,
+                // keyNotRegistered. Each is either a decision or a broken registration, and
+                // keyNotRegistered is precisely the one the rebuild below exists for.
+                return false
+            }
+        }
+
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch error.code {
+        case NSURLErrorTimedOut, NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost,
+             NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet,
+             NSURLErrorDNSLookupFailed, NSURLErrorInternationalRoamingOff,
+             NSURLErrorDataNotAllowed, NSURLErrorCallIsActive:
+            return true
+        default:
+            // NSURLErrorSecureConnectionFailed, ...ServerCertificateUntrusted,
+            // ...ServerCertificateHasBadDate, ...ClientCertificateRejected and the -999 a pinning
+            // delegate raises when it rejects a chain all land here, unretried, on purpose.
+            return false
+        }
+    }
+
+    /// Failures that say something about the *channel*, never about the registration.
+    ///
+    /// These get neither a retry nor a rebuild. A rebuild would be the worse of the two: it throws
+    /// away a working Secure Enclave key on a signal an attacker can produce at will, and then
+    /// attests all over again across the very connection that just failed to prove itself. The
+    /// registration is not what is broken here, so it is not what gets spent.
+    private static func keyDeliveryChannelCompromised(_ error: Error?) -> Bool {
+        guard let error = error as NSError? else { return false }
+        if error.domain == NXAppAttestErrorDomain {
+            return error.code == NXAppAttestError.pinningFailed.rawValue
+        }
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch error.code {
+        case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid, NSURLErrorClientCertificateRejected,
+             NSURLErrorClientCertificateRequired,
+             // What URLSession reports when the pinning delegate refuses the chain it was handed.
+             NSURLErrorCancelled:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// What a retry has to satisfy before it is allowed out.
+    ///
+    /// "Try three times" without this is just three chances to send an assertion somewhere it should
+    /// not go. Three conditions, each checked at the mode that owns it:
+    ///
+    ///   - there is a network. Retrying into a radio that is down spends a try and learns nothing;
+    ///     `fail()` already parks the whole chain on this rather than counting it as an attempt.
+    ///   - the device is still clean, at the modes that revoke on a runtime threat. A threat that
+    ///     arrived between two attempts must not be handed the second one.
+    ///   - the pinned channel binding for this endpoint is still held, at the modes that require a
+    ///     server chain. This is not fresh proof about the next handshake - it says this host has
+    ///     pinned successfully at least once in this process, because RASPGuard's per-host map is
+    ///     only ever written by a pin evaluation that passed. The authoritative refusal is still the
+    ///     one in AppAttestManager.m, which will not send an assertion without a binding at those
+    ///     modes; checking here stops the retry one round trip earlier.
+    ///
+    /// Both mode-gated conditions are gated on purpose. At `.regular` neither is a control the host
+    /// ever had, and adding one here would turn a retry into a refusal a shipping mode 3 app never
+    /// agreed to.
+    private static func keyDeliveryChannelStillTrusted() -> Bool {
+        guard ZTAReachability.isConnected else {
+            NXLogger.appAttest.publicInfo("[AppAttest] Retry key delivery dibatalkan: jaringan tidak tersedia.")
+            return false
+        }
+        if NXSecurityPolicy.revokesOnRuntimeThreat() {
+            guard RASPGuard.shared().deviceClean,
+                  RASPGuard.shared().lastThreatMask == RASP_THREAT_NONE else {
+                NXLogger.appAttest.publicError("[AppAttest] Retry key delivery dibatalkan: ancaman runtime terdeteksi.")
+                return false
+            }
+        }
+        if NXSecurityPolicy.requiresServerChain() {
+            let binding = RASPGuard.shared().pinnedLeafSPKI(forEndpoint: configuration.keyDeliveryEndpoint) ?? ""
+            guard !binding.isEmpty else {
+                NXLogger.appAttest.publicError("[AppAttest] Retry key delivery dibatalkan: channel binding TLS tidak terpasang.")
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func deliverKey(attempt: Int = 0, tries: Int = 1) {
         AppAttestService.shared.requestKeyDelivery { key, error in
             guard let key else {
                 NXLogger.appAttest.publicError("[AppAttest] Key delivery/server assertion failed.")
+
+                // Nothing about a channel that failed to prove itself is evidence against the
+                // registration, so this path spends neither a retry nor the key.
+                if keyDeliveryChannelCompromised(error) {
+                    NXLogger.appAttest.publicError(
+                        "[AppAttest] Key delivery dihentikan: channel TLS tidak terbukti - registrasi tidak dibuang.")
+                    fail(error)
+                    return
+                }
+
+                // A dropped connection is not a broken registration, so send the same registration
+                // again before spending it. This is safe against replay rather than merely
+                // convenient: every call to requestKeyDelivery fetches its own challenge from the
+                // server (AppAttestManager.m:807) and signs a fresh nonce-bound assertion over it,
+                // so a retry is a new request and never a resend of the one that just failed.
+                if tries < keyDeliveryMaxTries, keyDeliveryWorthRetrying(error) {
+                    // Transport said try again; the preconditions say whether we may. When they say
+                    // no - no network, a runtime threat, no pinned binding - this hands over to
+                    // `fail()`, which parks the chain on reachability without counting an attempt.
+                    // It deliberately does NOT fall through to the rebuild below: discarding a good
+                    // registration because the radio is down is the exact behaviour this ladder
+                    // exists to remove.
+                    guard keyDeliveryChannelStillTrusted() else { fail(error); return }
+
+                    let wait = keyDeliveryBackoff[min(tries - 1, keyDeliveryBackoff.count - 1)]
+                    NXLogger.appAttest.publicInfo(
+                        "[AppAttest] Key delivery diulang dalam \(Int(wait))s (percobaan \(tries + 1)/\(keyDeliveryMaxTries)).")
+                    // Tied to this chain. The watchdog can release `inFlight` while these retries
+                    // are still spaced out, and a resume or the retry button would then start a
+                    // second chain; a retry belonging to the chain that lost the flag must not keep
+                    // stepping on the flow state of the one that took it.
+                    let armed = generation
+                    DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+                        guard generation == armed, !sessionReady else { return }
+                        deliverKey(attempt: attempt, tries: tries + 1)
+                    }
+                    return
+                }
+
+                // Two ways here, and both point at the registration rather than the link: three
+                // transport retries all failed while the channel held, or the server named a fault
+                // no retry can clear - `keyNotRegistered` above all, which is precisely what a
+                // rebuild fixes. Allowed exactly once; `attempt` is what makes that true.
                 guard attempt == 0 else { fail(error); return }
+                NXLogger.appAttest.publicError(
+                    "[AppAttest] Key delivery gagal setelah \(tries)x - registrasi dibuang, mendaftar ulang.")
+                SecurityAuditChain.append(event: "appattest_registration_rebuilt",
+                                          detail: ["key_delivery_tries": tries])
                 AppAttestManager.shared().clearRegistration()
                 UserDefaults.standard.removeObject(forKey: "nx_appattest_env")
+                let armed = generation
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    guard generation == armed, !sessionReady else { return }
                     AppAttestService.shared.configure()
                     registerThenAssertThenDeliverKey(attempt: 1)
                 }

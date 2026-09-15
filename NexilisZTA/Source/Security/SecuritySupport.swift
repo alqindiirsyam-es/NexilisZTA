@@ -163,8 +163,15 @@ enum SPKI {
 
 public enum SecurityAuditChain {
 
-    private static let logKey = "nx_audit_log_v2"
-    private static let headKey = "nx_audit_head_v2"
+    // v3, and the bump is not cosmetic. Records written as v2 were MAC'd over `canonical()` as it
+    // was then - a form that did not survive the JSON round trip into UserDefaults (see the note on
+    // `canonical` below), so those MACs never verified and never can. Re-reading them under the
+    // corrected canonical form would not rescue them; it would only report a broken chain forever
+    // on every upgraded install. A new key starts a fresh chain at genesis, and the v2 entries are
+    // removed rather than left to occupy storage nobody will ever read.
+    private static let logKey = "nx_audit_log_v3"
+    private static let headKey = "nx_audit_head_v3"
+    private static let legacyKeys = ["nx_audit_log_v2", "nx_audit_head_v2"]
     private static let keyService = "io.nexilis.zta.audit.hmac"
     private static let keyAccount = "device"
     private static let genesis = String(repeating: "0", count: 64)
@@ -176,12 +183,63 @@ public enum SecurityAuditChain {
     public static var onHeadChanged: ((String) -> Void)?
 
     public static func append(event: String, detail: [String: Any] = [:]) {
-        guard let key = auditKey() else { return }
+        let key: SymmetricKey
+        switch auditKeyState(createIfMissing: true) {
+        case .available(let k):
+            key = k
+
+        case .unavailable:
+            // The key exists but cannot be read right now, or could not be created. Appending is
+            // skipped and - this is the whole point - nothing is destroyed. The old code could not
+            // tell this case from an absent key and answered both by minting a new one, which
+            // silently orphaned every record already in the log.
+            return
+
+        case .recreated(let k):
+            key = k
+            // A new key cannot verify records signed by the old one, so a log left behind here
+            // would report a broken chain for the rest of the install's life - `verifyChain` would
+            // fail on the first MAC, every time, with nothing able to clear it. Start a fresh chain
+            // instead, and say so in it: a genesis restart that explains itself is evidence, while
+            // one that just appears is indistinguishable from an attacker truncating the log.
+            //
+            // The server sees this too. It records `audit_head` per session, so a head that jumped
+            // back to genesis is visible there whatever the device says about it.
+            if !logIsEmpty() {
+                UserDefaults.standard.removeObject(forKey: logKey)
+                UserDefaults.standard.removeObject(forKey: headKey)
+                appendRecord(event: "audit_chain_restarted",
+                             detail: ["reason": "hmac key missing; prior records unverifiable"],
+                             key: key)
+            }
+        }
+        for k in legacyKeys { UserDefaults.standard.removeObject(forKey: k) }
+        appendRecord(event: event, detail: detail, key: key)
+    }
+
+    /// Whether the stored log holds no records.
+    ///
+    /// Distinct from "unreadable": a log that will not parse yields an empty array here and is
+    /// treated as empty, which is the safe reading - there is nothing in it anyone can verify.
+    private static func logIsEmpty() -> Bool {
+        let raw = UserDefaults.standard.string(forKey: logKey) ?? "[]"
+        let log = (try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [[String: Any]]) ?? []
+        return log.isEmpty
+    }
+
+    private static func appendRecord(event: String, detail: [String: Any], key: SymmetricKey) {
         let head = UserDefaults.standard.string(forKey: headKey) ?? genesis
         var log = (try? JSONSerialization.jsonObject(
             with: Data((UserDefaults.standard.string(forKey: logKey) ?? "[]").utf8)) as? [[String: Any]]) ?? []
-        var rec: [String: Any] = ["ts": Date().timeIntervalSince1970 * 1000,
-                                  "event": event, "detail": detail, "prev": head]
+        // `detail` comes from callers. Anything that cannot survive the trip through JSON has to be
+        // dropped BEFORE the record is signed, not after - otherwise the object that was MAC'd and
+        // the object that gets stored are not the same object.
+        let safeDetail = JSONSerialization.isValidJSONObject(detail) ? detail : [:]
+        // Whole milliseconds. The fractional Double this used to store round-trips correctly today,
+        // but it makes the MAC depend on floating-point formatting staying stable across OS
+        // versions, and there is nothing to gain from sub-millisecond precision in an audit log.
+        var rec: [String: Any] = ["ts": Int(Date().timeIntervalSince1970 * 1000),
+                                  "event": event, "detail": safeDetail, "prev": head]
         let body = canonical(rec)
         let chained = hmacHex(key: key, message: head + body)
         rec["mac"] = chained
@@ -196,7 +254,26 @@ public enum SecurityAuditChain {
     }
 
     public static func verifyChain() -> Bool {
-        guard let key = auditKey(createIfMissing: false) else { return false }
+        let key: SymmetricKey
+        switch auditKeyState(createIfMissing: false) {
+        case .available(let k):
+            key = k
+        case .unavailable, .recreated:
+            // No key, so no MAC can be checked - but an EMPTY chain has no MAC to check. Its only
+            // invariant is that the head never moved off genesis, and that is verifiable without a
+            // key. Returning false here was a false negative with real cost: it is the state of a
+            // fresh install whose first `append` has not landed yet, and of one that launched
+            // before the first unlock after a reboot, and it made both report a broken audit chain
+            // to the server - the symptom that started this.
+            //
+            // A non-empty log with no key stays false, which is correct: those records were signed
+            // by something, and it is not available to say by what.
+            //
+            // This is not a claim that deletion is detectable locally. Wiping the log, the head and
+            // the key together yields a clean genesis chain here, and always did; what makes that
+            // visible is the server's record of the head, not this function.
+            return logIsEmpty() && headHash() == genesis
+        }
         let log = (try? JSONSerialization.jsonObject(
             with: Data((UserDefaults.standard.string(forKey: logKey) ?? "[]").utf8)) as? [[String: Any]]) ?? []
         var prev: String? = nil
@@ -229,9 +306,31 @@ public enum SecurityAuditChain {
         SecItemDelete(query as CFDictionary)
     }
 
+    /// The signed form of a record. It must be identical when computed from the live Swift values
+    /// at append time and from the Foundation values read back out of UserDefaults - and the
+    /// version this replaced was not.
+    ///
+    /// It interpolated each value with `"\(value)"`, which prints the *runtime type's* description,
+    /// and the runtime types change across a JSON round trip. An empty `detail` is the one that
+    /// gave it away: `[String: Any]()` prints `[:]`, while the `__NSDictionary0` that comes back
+    /// from JSONSerialization prints `{\n}`. Different string, different HMAC, so `verifyChain()`
+    /// returned false for every log holding at least one record - which is every log, because
+    /// APISZTA appends `zta_verification_start` before anything else runs. Devices were reporting a
+    /// broken audit chain because the verifier disagreed with the signer, not because anything had
+    /// been tampered with.
+    ///
+    /// `canonicalJSON` is the codebase's one canonical form - recursive, sorted, compact, and
+    /// already held byte-identical to `NXCanonicalJSONData` and the server's `canonicalize`. It
+    /// renders numbers through `NSNumber.stringValue` and containers structurally, so it does not
+    /// care which concrete class Foundation hands it.
+    ///
+    /// The empty-string fallback is unreachable: `appendRecord` only ever passes a record whose
+    /// `detail` has already been checked with `isValidJSONObject`. It is deterministic in any case,
+    /// so append and verify would still agree rather than silently disagreeing.
     private static func canonical(_ d: [String: Any]) -> String {
-        let sorted = d.keys.sorted()
-        return sorted.map { "\($0)=\(d[$0] ?? "")" }.joined(separator: "&")
+        guard let data = try? SentinelSensitiveTransaction.canonicalJSON(d),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
     }
 
     private static func hmacHex(key: SymmetricKey, message: String) -> String {
@@ -247,7 +346,22 @@ public enum SecurityAuditChain {
         return diff == 0
     }
 
-    private static func auditKey(createIfMissing: Bool = true) -> SymmetricKey? {
+    /// The three outcomes of looking for the chain's HMAC key, kept apart because the caller must
+    /// treat them differently. Collapsing them into `SymmetricKey?` is what made the old code
+    /// destructive: `nil` meant both "there is no key" and "the key is there but I cannot read it",
+    /// and the recovery for the first is the worst possible response to the second.
+    private enum AuditKeyState {
+        /// Read back intact. Ordinary case.
+        case available(SymmetricKey)
+        /// Not usable right now, and nothing was changed. Either the item is present but
+        /// unreadable, or a new one could not be stored.
+        case unavailable
+        /// There was no usable key, and this one was just minted. Anything already in the log was
+        /// signed by a key that is gone.
+        case recreated(SymmetricKey)
+    }
+
+    private static func auditKeyState(createIfMissing: Bool) -> AuditKeyState {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keyService,
@@ -256,22 +370,43 @@ public enum SecurityAuditChain {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var item: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-           let data = item as? Data, data.count == 32 {
-            return SymmetricKey(data: data)
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+
+        if status == errSecSuccess, let data = item as? Data, data.count == 32 {
+            return .available(SymmetricKey(data: data))
         }
-        guard createIfMissing else { return nil }
+
+        // Anything other than "not found" means the keychain answered about an item it has, and the
+        // one answer that matters is `errSecInteractionNotAllowed`: this key is
+        // AfterFirstUnlockThisDeviceOnly, so a launch before the first unlock after a reboot - a
+        // background fetch, a push wake - reads it and is refused. Treating that as absence deleted
+        // a perfectly good key and broke the chain permanently, from a condition that would have
+        // resolved itself the moment the reader unlocked the phone.
+        //
+        // `errSecSuccess` with a value that is not 32 bytes deliberately falls through: the item is
+        // there but it is not a key, and replacing it is the only way forward.
+        if status != errSecSuccess && status != errSecItemNotFound {
+            return .unavailable
+        }
+
+        guard createIfMissing else { return .unavailable }
+
         var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            return .unavailable
+        }
         let data = Data(bytes)
         var add = query
         add.removeValue(forKey: kSecReturnData as String)
         add.removeValue(forKey: kSecMatchLimit as String)
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        // Reached only when the read said not-found or returned something that is not a key, so
+        // this clears a malformed item and never a usable one. That is the guarantee the old
+        // unconditional delete did not have.
         SecItemDelete(query as CFDictionary)
-        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { return nil }
-        return SymmetricKey(data: data)
+        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { return .unavailable }
+        return .recreated(SymmetricKey(data: data))
     }
 }
 
@@ -871,14 +1006,14 @@ public enum SentinelSensitiveTransaction {
             throw error("reserved Sentinel proof field present")
         }
         let payload     = sha256Hex(bytes)
-        let txid        = first(object, ["transaction_id", "trx_id", "reference_id", "reference", "ref_id"])
-        let type        = firstDefault(object, ["transaction_type", "type", "operation_type"], "ppob_transaction")
-        let source      = first(object, ["source_account_id", "from_account", "account_from", "source_account", "sourceAccount"])
-        let beneficiary = first(object, ["beneficiary_id", "beneficiary_account", "destination_account", "to_account", "account_to", "msisdn"])
-        let bank        = first(object, ["beneficiary_bank", "beneficiary_bank_code", "bank_code", "destination_bank"])
-        let merchant    = first(object, ["merchant_id", "biller_id", "merchant", "biller"])
-        let amount      = firstLong(object, ["amount_minor", "amount"], 0)
-        let currency    = firstDefault(object, ["currency"], "IDR")
+        let txid        = try firstStrict(object, "transaction_id", ["transaction_id", "trx_id", "reference_id", "reference", "ref_id"])
+        let type        = try firstDefaultStrict(object, "transaction_type", ["transaction_type", "type", "operation_type"], "ppob_transaction")
+        let source      = try firstStrict(object, "source_account_id", ["source_account_id", "from_account", "account_from", "source_account", "sourceAccount"])
+        let beneficiary = try firstStrict(object, "beneficiary_id", ["beneficiary_id", "beneficiary_account", "destination_account", "to_account", "account_to", "msisdn"])
+        let bank        = try firstStrict(object, "beneficiary_bank", ["beneficiary_bank", "beneficiary_bank_code", "bank_code", "destination_bank"])
+        let merchant    = try firstStrict(object, "merchant_id", ["merchant_id", "biller_id", "merchant", "biller"])
+        let amount      = try firstLongStrict(object, "amount_minor", ["amount_minor", "amount"], 0)
+        let currency    = try firstDefaultStrict(object, "currency", ["currency"], "IDR")
 
         let fields: [String: String] = [
             "amount_minor": String(amount), "beneficiary_bank": bank, "beneficiary_id": beneficiary,
@@ -950,24 +1085,75 @@ public enum SentinelSensitiveTransaction {
         return out
     }
 
-    private static func first(_ o: [String: Any], _ keys: [String]) -> String {
+    // MARK: - Resolving one semantic field out of several spellings
+    //
+    // Each semantic field has a list of names a payload may use for it — `beneficiary_id` alone
+    // answers to six. Resolving that used to mean "take the first one present", and taking the
+    // first one silently is the whole problem: a payload carrying two spellings with *different*
+    // values has no single meaning, and every reader is free to pick a different one.
+    //
+    // That is not a hypothetical. The proof this type builds only binds what *this* code decided
+    // the transaction was. A relying party that prefers a different alias executes a different
+    // transaction, and every signature still verifies, because each side hashed its own reading.
+    // The user approved one beneficiary and the money went to another, with a full set of valid
+    // cryptographic evidence attesting to it.
+    //
+    // So ambiguity is refused rather than resolved. A payload that names one field twice with two
+    // answers cannot be signed here at all, which is the only reading that cannot be disagreed
+    // with downstream. Same rule on the server (`SentinelTransactionContext`) and on Android
+    // (`SemanticTransaction`) — three implementations that fail closed on the same input.
+
+    /// The one value this field has, or a refusal if the payload gives it more than one.
+    ///
+    /// Repeating an alias with the *same* value is fine — that is a payload being redundant, not
+    /// ambiguous. A structured or boolean value where a scalar belongs is refused too: coercing
+    /// `["x"]` or `true` into text is another place where two readers can disagree.
+    private static func firstStrict(_ o: [String: Any], _ semantic: String, _ keys: [String]) throws -> String {
+        var chosen: String?
         for k in keys {
-            guard let v = o[k], !(v is NSNull) else { continue }
-            let s = string(v).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !s.isEmpty { return s }
+            guard let raw = o[k], !(raw is NSNull) else { continue }
+            if raw is [String: Any] || raw is [Any] || CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
+                throw error("SENSITIVE_SEMANTIC_TYPE_INVALID:\(semantic)")
+            }
+            let v = string(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            if v.isEmpty { continue }
+            if let c = chosen, c != v { throw error("SENSITIVE_SEMANTIC_ALIAS_CONFLICT:\(semantic)") }
+            chosen = v
         }
-        return ""
+        return chosen ?? ""
     }
-    private static func firstDefault(_ o: [String: Any], _ keys: [String], _ d: String) -> String {
-        let v = first(o, keys); return v.isEmpty ? d : v
+
+    private static func firstDefaultStrict(_ o: [String: Any], _ semantic: String,
+                                           _ keys: [String], _ d: String) throws -> String {
+        let v = try firstStrict(o, semantic, keys)
+        return v.isEmpty ? d : v
     }
-    private static func firstLong(_ o: [String: Any], _ keys: [String], _ d: Int64) -> Int64 {
+
+    /// The same rule for money, where the ways to disagree are worse.
+    ///
+    /// `firstLong` used to hand anything to `NSNumber.int64Value`, which truncates: `1000.7` became
+    /// 1000, `"1e3"` became 0 through the string path, and `true` became 1 — an amount of one
+    /// minor unit conjured out of a boolean. Every one of those is a number this code invented and
+    /// then signed for. Only an exact integer literal is accepted now, bounded to 19 digits so it
+    /// cannot overflow Int64 on the way in.
+    private static func firstLongStrict(_ o: [String: Any], _ semantic: String,
+                                        _ keys: [String], _ d: Int64) throws -> Int64 {
+        var chosen: Int64?
         for k in keys {
-            guard let v = o[k], !(v is NSNull) else { continue }
-            if let n = v as? NSNumber { return n.int64Value }
-            if let n = Int64(string(v)) { return n }
+            guard let raw = o[k], !(raw is NSNull) else { continue }
+            if raw is [String: Any] || raw is [Any] || CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
+                throw error("SENSITIVE_SEMANTIC_NUMBER_INVALID:\(semantic)")
+            }
+            let text = string(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { continue }
+            guard text.range(of: "^-?(0|[1-9][0-9]{0,18})$", options: .regularExpression) != nil,
+                  let parsed = Int64(text) else {
+                throw error("SENSITIVE_SEMANTIC_NUMBER_INVALID:\(semantic)")
+            }
+            if let c = chosen, c != parsed { throw error("SENSITIVE_SEMANTIC_ALIAS_CONFLICT:\(semantic)") }
+            chosen = parsed
         }
-        return d
+        return chosen ?? d
     }
     private static func string(_ value: Any?) -> String {
         guard let value else { return "" }

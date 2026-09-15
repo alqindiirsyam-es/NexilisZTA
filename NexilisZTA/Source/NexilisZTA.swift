@@ -110,6 +110,13 @@ public struct NexilisZTAConfiguration {
 
     /// Release signing/entitlement identity expected by the RASP integrity gate. Hardened
     /// authorization refuses to start until all four are configured.
+    ///
+    /// All four must be values the *host* hard-codes, not values read back from the running
+    /// bundle. `expectedBundleID` in particular used to default to `Bundle.main.bundleIdentifier`,
+    /// which reads the identity out of the very bundle the check is meant to judge: a repackaged
+    /// app carries its own Info.plist, so the comparison would have matched whatever it was given.
+    /// It never actually ran — `releaseIdentityConfigured` needs all four non-empty and the other
+    /// three defaulted to `""` — but a field populated that way reads as configured when it is not.
     public var expectedBundleID: String
     public var expectedApplicationID: String
     public var expectedTeamID: String
@@ -141,8 +148,16 @@ public struct NexilisZTAConfiguration {
         self.appMode = NXSecurityPolicy.mode
         self.pinnedHostPins = ["newuniverse.io": [NXEncryptedNewUniversePin()]]
         self.minimumAppAttestOSMajor = 14
-        self.rotationSignerSPKIBase64 = nil
-        self.expectedBundleID = Bundle.main.bundleIdentifier ?? ""
+        // Signed pin rotation is live now, not a hook waiting for a host to fill in. While this
+        // was nil `PinSetStore.verify` refused every payload (SecuritySupport.swift:134), so the
+        // compiled-in primary/backup pair was the whole pin set for the life of each build - and a
+        // certificate whose key changed could only be recovered from by shipping a new binary.
+        //
+        // A host that runs its own ZTA service overrides this with its own signer; the default
+        // points at the Nexilis one, which is the right answer for every host talking to
+        // nexilis.io.
+        self.rotationSignerSPKIBase64 = NXEncryptedPinRotationSignerSPKI()
+        self.expectedBundleID = ""
         self.expectedApplicationID = ""
         self.expectedTeamID = ""
         self.expectedAppAttestEnvironment = ""
@@ -156,6 +171,8 @@ public struct NexilisZTAConfiguration {
     ///   - apiKey: key issued for that identity.
     ///   - primaryPin: SPKI pin of the ZTA host, `sha256/<base64>`. Nil keeps the built-in one.
     ///   - backupPin: the pin a rotation switches to. Nil keeps the built-in one.
+    ///   - rotationSignerSPKIBase64: public key that signs runtime pin rotations. Nil keeps the
+    ///     built-in Nexilis signer; a host running its own ZTA service supplies its own.
     ///   - featureAccessURL: where the feature-access policy is pulled from. Nil keeps the
     ///     compiled-in one, which is not derived from `baseURL` - it sits at its own path on its
     ///     own host - so a host running its own policy service has to name it here.
@@ -201,7 +218,10 @@ public struct NexilisZTAConfiguration {
         self.appMode = appMode
         if let pinnedHostPins { self.pinnedHostPins = pinnedHostPins }
         if let minimumAppAttestOSMajor { self.minimumAppAttestOSMajor = minimumAppAttestOSMajor }
-        self.rotationSignerSPKIBase64 = rotationSignerSPKIBase64
+        // `if let`, like backupPin above: a host pointing at nexilis.io and omitting this argument
+        // must keep the built-in Nexilis signer. Assigning nil here silently disabled signed pin
+        // rotation at .regular and failed -7006 at .hsa for every host using this initializer.
+        if let rotationSignerSPKIBase64 { self.rotationSignerSPKIBase64 = rotationSignerSPKIBase64 }
         self.securityPackSignerSPKIBase64 = securityPackSignerSPKIBase64
         if let expectedBundleID { self.expectedBundleID = expectedBundleID }
         if let expectedApplicationID { self.expectedApplicationID = expectedApplicationID }

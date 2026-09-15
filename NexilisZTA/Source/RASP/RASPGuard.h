@@ -47,7 +47,21 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)serverTrust:(SecTrustRef)trust matchesPinnedSPKIForHost:(NSString *)host;
 - (void)reportPinningFailureForHost:(NSString *)host;
 
-/* A.3 — last leaf SPKI hex for channel-binding in AppAttestManager */
+/*
+ * A.3 — channel binding: the pinned leaf this process actually reached a given host over.
+ *
+ * Ask for the host the request is about to go to. The answer is what that host's certificate
+ * hashed to on the most recent connection that passed pinning, so it describes the channel the
+ * request will travel, and it stays the same for that host across the life of the certificate.
+ *
+ * `lastPinnedLeafSPKIHex` is the same value for whichever host connected last, whatever host that
+ * was. This library pins several — the ZTA service and the operator domain among them — so the
+ * moment anything else makes a pinned request, that property stops describing the ZTA channel.
+ * It is kept for diagnostics and for hosts already reading it; nothing that binds a request to a
+ * channel should use it. Use `-pinnedLeafSPKIForHost:` instead.
+ */
+- (nullable NSString *)pinnedLeafSPKIForHost:(NSString *)host;
+- (nullable NSString *)pinnedLeafSPKIForEndpoint:(nullable NSString *)endpoint;
 @property (nonatomic, copy, nullable) NSString *lastPinnedLeafSPKIHex;
 
 @property (nonatomic, assign) NSTimeInterval monitoringInterval;

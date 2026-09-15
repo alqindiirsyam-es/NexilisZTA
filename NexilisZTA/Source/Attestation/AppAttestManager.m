@@ -562,8 +562,16 @@ static NSString *NXDeviceModel(void) {
     }] resume];
 }
 
-static NSString *NXCurrentChannelBinding(void) {
-    NSString *pin = [RASPGuard sharedGuard].lastPinnedLeafSPKIHex;
+/// The pinned channel the request about to be built will actually travel over.
+///
+/// Takes the endpoint because the answer differs per host and the caller is the only one that
+/// knows where it is going. This used to read `lastPinnedLeafSPKIHex`, a single value overwritten
+/// by whichever pinned host connected most recently — and NexilisLite talks to the operator domain
+/// continuously once a session is open, so from the first of those calls onward every ZTA request
+/// quoted the operator's certificate as its own channel. Nothing caught it while no server checked
+/// the value; a server that does check it refuses the request instead.
+static NSString *NXChannelBindingForEndpoint(NSString *endpoint) {
+    NSString *pin = [[RASPGuard sharedGuard] pinnedLeafSPKIForEndpoint:endpoint];
     return pin.length > 0 ? pin : nil;
 }
 
@@ -614,7 +622,7 @@ static NSString *NXCurrentChannelBinding(void) {
                     // .regular may legitimately have none - a host pointing at its own domain,
                     // which isPinnedHost does not cover - so it binds when it can and goes on
                     // when it cannot, rather than refusing to register at all.
-                    NSString *channelBinding = NXCurrentChannelBinding();
+                    NSString *channelBinding = NXChannelBindingForEndpoint(self.attestEndpoint);
                     if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
                         completion(NO, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during registration"));
                         return;
@@ -716,7 +724,7 @@ static NSString *NXCurrentChannelBinding(void) {
         body[@"device_model"] = NXDeviceModel();
         body[@"bundle_id"] = [[NSBundle mainBundle] bundleIdentifier] ?: @"<unknown>";
         body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
-        NSString *channelBinding = NXCurrentChannelBinding();
+        NSString *channelBinding = NXChannelBindingForEndpoint(self.registerEndpoint);
         if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
             completion(NO, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during delivery-key registration"));
             return;
@@ -809,7 +817,7 @@ static NSString *NXCurrentChannelBinding(void) {
             body[@"device_posture"] = devicePosture ?: @{};
             body[@"os_version"] = [[UIDevice currentDevice] systemVersion] ?: @"<unknown>";
             body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
-            NSString *channelBinding = NXCurrentChannelBinding();
+            NSString *channelBinding = NXChannelBindingForEndpoint(self.keyDeliveryEndpoint);
             if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
                 completion(nil, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during key delivery"));
                 return;
@@ -1044,7 +1052,7 @@ static NSString *NXCurrentChannelBinding(void) {
         body[@"challenge"] = NXBase64(nonce);
         body[@"reason"] = @"client_clear_registration";
         body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
-        NSString *channelBinding = NXCurrentChannelBinding();
+        NSString *channelBinding = NXChannelBindingForEndpoint(self.revokeEndpoint);
         if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
 
         NSError *canonicalError = nil;
@@ -1117,7 +1125,7 @@ static NSString *NXCurrentChannelBinding(void) {
             @"os_version": [[UIDevice currentDevice] systemVersion] ?: @"<unknown>",
             @"device_model": NXDeviceModel(),
         };
-        NSString *channelBinding = NXCurrentChannelBinding();
+        NSString *channelBinding = NXChannelBindingForEndpoint(self.statusVerifyEndpoint);
         if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
             completion(nil, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during status verify"));
             return;

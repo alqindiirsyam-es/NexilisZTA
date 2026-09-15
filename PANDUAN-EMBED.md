@@ -285,6 +285,61 @@ sudah terbukti memakan waktu: `STRIP_STYLE` menggagalkan target pustaka, dan
 `GCC_SYMBOLS_PRIVATE_EXTERN` menyembunyikan simbol yang justru merupakan antarmuka sebuah
 framework.
 
+### Paruh kedua: identitas rilis
+
+Pengerasan punya dua paruh, dan yang di atas baru paruh **biner** — enkripsi string, strip simbol,
+kunci per-build. Paruh **identitas** memberi tahu gerbang integritas RASP siapa yang seharusnya
+menjalankan kode ini: bundle id, application id, team id, dan environment App Attest.
+
+Keduanya berkas terpisah karena isinya berbeda sifat. Yang biner sama untuk semua host. Yang
+identitas berisi bundle dan team id sungguhan milik Anda, jadi ia per-host dan tidak masuk source
+control — polanya sama persis dengan `SentinelPerBuildSecrets.xcconfig`.
+
+Salin templatnya, isi keempat nilainya, dan letakkan di sebelah berkas hardening:
+
+```sh
+cp Hardening/HardenedRelease.xcconfig.example Hardening/HardenedRelease.xcconfig
+```
+
+```
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) \
+  NEXILIS_EXPECTED_BUNDLE_ID=\"com.perusahaan.app\" \
+  NEXILIS_EXPECTED_APP_ID=\"TEAMID.com.perusahaan.app\" \
+  NEXILIS_EXPECTED_TEAM_ID=\"TEAMID\" \
+  NEXILIS_EXPECTED_APPATTEST_ENV=\"production\"
+```
+
+`post_install` di `Podfile` sudah menyisipkan kedua berkas ke konfigurasi Release target pustaka.
+`#include?` memakai tanda tanya, jadi selama berkas identitas belum ada, tidak ada yang berubah:
+gerbang di `RASPGuard.m` menuntut **keempat** makro sebelum ikut terkompilasi, jadi tiga yang hilang
+membuatnya tetap di luar binary — sama seperti sebelum Anda membaca bagian ini.
+
+**Keempat-empatnya, atau tidak sama sekali.** Mengisi sebagian tidak mengaktifkan apa pun, dan itu
+justru pernah menjadi jebakan di repositori ini: satu makro terdefinisi sendirian selama beberapa
+rilis, terlihat seperti pemeriksaan yang menyala padahal tidak pernah terkompilasi.
+
+**Jangan pernah memakai `$(PRODUCT_BUNDLE_IDENTIFIER)` untuk nilai-nilai ini.** Berkas identitas
+dilampirkan ke target **pod**, dan di sana variabel itu meresolusi ke bundle id pod
+(`org.cocoapods.NexilisZTA`), bukan milik aplikasi Anda. Hasilnya perbandingan yang selalu gagal
+dan `RASP_THREAT_TAMPERED` di setiap peluncuran build rilis. Nilainya harus literal.
+
+Alasan yang sama berlaku untuk jalur runtime: `NexilisZTAConfiguration.expectedBundleID` dan
+kembarannya juga harus nilai yang Anda tulis sendiri, bukan yang dibaca dari `Bundle.main`.
+Membaca identitas dari bundle yang sedang diperiksa berarti membandingkan sesuatu dengan dirinya
+sendiri — aplikasi yang dibungkus ulang membawa `Info.plist`-nya sendiri, dan perbandingan itu akan
+lolos.
+
+Verifikasi setelah mengisinya:
+
+```sh
+xcodebuild -showBuildSettings -project Pods/Pods.xcodeproj \
+           -target NexilisZTA -configuration Release \
+  | grep GCC_PREPROCESSOR_DEFINITIONS
+```
+
+Keempat `NEXILIS_EXPECTED_*` harus muncul berdampingan dengan `NEXILIS_RELEASE_HARDENING=1` dan
+kedua kunci XOR.
+
 ### Jangan matikan simbol debug
 
 Kalau target aplikasi Anda menyetel `GCC_GENERATE_DEBUGGING_SYMBOLS = NO`, **nyalakan kembali**.
