@@ -15,6 +15,9 @@ perubahan yang mengubah cara memasang, dan ketiganya ada di sini:
 3. `NexilisZTAConfiguration` punya beberapa properti baru — endpoint status, penanda tangan paket
    kebijakan, pin multi-host, dan mode aplikasi.
 
+**Kombinasi NexilisZTA / SecurityShield / NexilisLite** (ZTA saja, + SS, Lite tanpa SS, SS saja, Lite
+saja, dst.) lewat CocoaPods & SPM, termasuk syarat Flutter di iOS 26: [PANDUAN-EMBED-KOMBINASI.md](PANDUAN-EMBED-KOMBINASI.md).
+
 Rujukan yang lebih dalam untuk lapisan ZTA saja: `NexilisZTA/PANDUAN-INTEGRASI.md`
 (entitlement, privacy shield, secure input, RASP). Untuk perbedaan mode 1/2/3 baris demi baris:
 `REMEDIATION_DOCS/SECURITY-LEVELS.md`.
@@ -27,6 +30,7 @@ Rujukan yang lebih dalam untuk lapisan ZTA saja: `NexilisZTA/PANDUAN-INTEGRASI.m
 |---|---|---|
 | **NexilisZTA** | RASP, App Attest, certificate pinning, Sentinel (paket kebijakan, telemetri, kill switch), secure input | Ya — NexilisLite bergantung padanya |
 | **NexilisLite** | CPaaS: chat, panggilan, konferensi, berkas | Ya, kalau Anda memakai fitur CPaaS |
+| **NexilisSecurityShield** | kebijakan keamanan institusi dari server (emulator, jailbreak, hook, debugger, OS usang, kloning, SIM swap, geovelocity, analisis perilaku) | Ikut otomatis bersama NexilisLite; bisa dipakai sendiri |
 
 Urutannya selalu sama dan tidak boleh dibalik: **ZTA memverifikasi dulu, CPaaS menyambung
 kemudian.** `APIS.connect` dipanggil di dalam closure keberhasilan `APISZTA.configure`, bukan
@@ -339,6 +343,43 @@ xcodebuild -showBuildSettings -project Pods/Pods.xcodeproj \
 
 Keempat `NEXILIS_EXPECTED_*` harus muncul berdampingan dengan `NEXILIS_RELEASE_HARDENING=1` dan
 kedua kunci XOR.
+
+### Aset terproteksi dan manifest High Assurance (mode 1 wajib, mode 2/3 opsional)
+
+Mode 1 menuntut dua berkas di bundle, dan keduanya dibuat saat rilis, bukan di-commit:
+
+1. **`SentinelProtectedAssets.spa`** — aset yang disegel AES-256-GCM (format Sentinel SPA1). Kunci 32
+   byte-nya tidak pernah ada di aplikasi; ia disimpan di server ZTA (`apps.json` →
+   `protectedAssetKeyB64`) dan dikirim lewat `/zta/key` hanya ke install yang lulus App Attest.
+
+   ```sh
+   openssl rand -base64 32 > /tempat/aman/protected-asset.key      # sekali per app, simpan offline
+   python3 tools/build_ios_protected_asset.py rahasia.bin SentinelProtectedAssets.spa \
+           --key-b64 "$(cat /tempat/aman/protected-asset.key)"     # butuh: pip install cryptography
+   ```
+
+2. **`sentinel_high_assurance_manifest.json`** — digest `__TEXT,__text` executable, digest `.spa`,
+   dan `build_id`. Harus dibuat **setelah link, sebelum code signing**, jadi lewat *Run Script build
+   phase* di target aplikasi, diletakkan setelah "Copy Bundle Resources" (Xcode menandatangani
+   produk sesudah semua script phase). Hilangkan centang "Based on dependency analysis".
+
+   ```sh
+   export SENTINEL_PROTECTED_ASSET_PATH="$SRCROOT/Secrets/SentinelProtectedAssets.spa"
+   export SENTINEL_HIGH_ASSURANCE_BUILD_ID="$MARKETING_VERSION+$CURRENT_PROJECT_VERSION"
+   "$SRCROOT/../tools/xcode_high_assurance_finalize.sh"
+   ```
+
+   Skrip mencetak tiga digest. Daftarkan ke server untuk versi/build itu — tanpa ini `/zta/key`
+   menolak dengan `IOS_RELEASE_UNKNOWN`:
+
+   ```json
+   "releases": [{ "short_version": "6.0.7", "build_version": "42",
+                  "protected_asset_sha256": "…", "executable_text_sha256": "…",
+                  "high_assurance_manifest_sha256": "…" }]
+   ```
+
+Setiap archive baru mengubah `executable_text_sha256`, jadi entri `releases` dibuat per build yang
+dirilis, bukan per versi pemasaran. Mode 2 dan 3 boleh tanpa keduanya; kalau ada, dicek juga.
 
 ### Jangan matikan simbol debug
 

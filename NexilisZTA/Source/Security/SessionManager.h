@@ -18,6 +18,14 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable NSString *)validSessionToken;
 @property (nonatomic, readonly) BOOL hasValidSession;
 
+/* Bootstrap user authentication (Sentinel v3.0.1): the short-lived credential the service
+ * issued after the institution's IdP assertion was consumed. Required for /key when the host
+ * configured a bootstrapAuthentication provider; cleared with everything else on clearAll. */
+- (void)storeUserAuthToken:(NSString *)jwt expiresAt:(NSDate *)expiry;
+- (nullable NSString *)validUserAuthToken;
+@property (nonatomic, readonly) BOOL hasValidUserAuth;
+- (void)clearUserAuth;
+/* Legacy, expiry-less form. Kept for callers that stored one; nothing in the chain reads it. */
 - (void)storeUserAuthToken:(NSString *)jwt;
 - (nullable NSString *)userAuthToken;
 

@@ -209,6 +209,15 @@ public enum SecurityPackPolicyValidator {
         // A model the pack has switched off needs no parameters to be correct.
         guard (model["enabled"] as? NSNumber)?.boolValue == true else { return true }
 
+        // The cross-platform 16-slot form: its own shape, checked by its own parser.
+        if (model["feature_schema"] as? String) == SentinelDetectionFeatureSchema.version {
+            guard let version = model["version"] as? String, !version.isEmpty, version.count <= 64,
+                  SentinelStatisticalRiskModel(pack: model) != nil,
+                  inRange(model["max_additive_risk"], 0, 30),
+                  inRange(model["bias"], -12, 12) else { return false }
+            return true
+        }
+
         guard let version = model["version"] as? String, !version.isEmpty, version.count <= 64,
               (model["feature_schema_version"] as? NSNumber)?.intValue
                   == SentinelOnDeviceStatisticalModel.featureSchemaVersion,

@@ -5,6 +5,7 @@
 
 #import "AppAttestManager.h"
 #import "RASPGuard.h"
+#import "SentinelOfflineGateURLProtocol.h"
 #import "NXSecurityPolicy.h"
 #import "SessionManager.h"
 #import <DeviceCheck/DeviceCheck.h>
@@ -73,6 +74,13 @@ static NSError *NXError(NSInteger code, NSString *message) {
  */
 static NSError *NXServerError(NSInteger statusCode, NSString *message) {
     BOOL transient = (statusCode >= 500) || (statusCode == 408) || (statusCode == 429) || (statusCode == 0);
+    // "device not registered" is the service saying it holds no registration for this key - the
+    // one refusal a rebuild is the answer to. Named as such, so the chain can tell it from every
+    // other 403 it must not rebuild on.
+    if (!transient && message != nil &&
+        [[message lowercaseString] rangeOfString:@"not registered"].location != NSNotFound) {
+        return NXError(NXAppAttestErrorKeyNotRegistered, message);
+    }
     return NXError(transient ? NXAppAttestErrorServerUnavailable : NXAppAttestErrorServerRejected, message);
 }
 
@@ -251,6 +259,11 @@ static NSString *NXDeviceModel(void) {
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         config.timeoutIntervalForRequest  = 15.0;
         config.timeoutIntervalForResource = 30.0;
+        config.URLCache = nil;  // see RASPGuard pinnedURLSession: a cached challenge is a spent one
+        config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        // Pinning bypassed, Barrier #1 not: the latch is about what ran locally, not TLS.
+        config.protocolClasses = [@[[SentinelOfflineGateURLProtocol class]]
+                                  arrayByAddingObjectsFromArray:config.protocolClasses ?: @[]];
         self.session = [NSURLSession sessionWithConfiguration:config
                                                      delegate:nil
                                                 delegateQueue:nil];
@@ -498,6 +511,7 @@ static NSString *NXDeviceModel(void) {
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:components.URL];
     request.HTTPMethod = @"GET";
+    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     request.timeoutInterval = 8.0;
 
     [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -544,6 +558,10 @@ static NSString *NXDeviceModel(void) {
     request.HTTPBody = jsonData;
     request.timeoutInterval = 12.0;
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    // Bootstrap user authentication: the service refuses /key without this once the app
+    // requires it. Sent whenever a live one exists; the service ignores it where it does not apply.
+    NSString *userAuth = [[SessionManager sharedManager] validUserAuthToken];
+    if (userAuth.length > 0) [request setValue:userAuth forHTTPHeaderField:@"X-Sentinel-User-Auth"];
 
     [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error) {
@@ -635,6 +653,9 @@ static NSString *NXChannelBindingForEndpoint(NSString *endpoint) {
                         @"os_version": [[UIDevice currentDevice] systemVersion] ?: @"<unknown>",
                         @"device_model": NXDeviceModel(),
                         @"bundle_id": [[NSBundle mainBundle] bundleIdentifier] ?: @"<unknown>",
+                        // Barrier #1 evidence, in the RC5 field names the service validates.
+                        @"rc4_offline_preflight": @([RASPGuard sharedGuard].offlinePreflightPassed),
+                        @"rc4_local_threat_mask": @([RASPGuard sharedGuard].lastThreatMask),
                     } mutableCopy];
                     // v2.0.1: channel binding is a mandatory precondition and is appended only
                     // after the non-empty guard above. This avoids ever constructing an
@@ -724,6 +745,9 @@ static NSString *NXChannelBindingForEndpoint(NSString *endpoint) {
         body[@"device_model"] = NXDeviceModel();
         body[@"bundle_id"] = [[NSBundle mainBundle] bundleIdentifier] ?: @"<unknown>";
         body[@"timestamp_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
+        // Barrier #1 evidence, signed with the rest of the body: the service can require it.
+        body[@"rc4_offline_preflight"] = @([RASPGuard sharedGuard].offlinePreflightPassed);
+        body[@"rc4_local_threat_mask"] = @([RASPGuard sharedGuard].lastThreatMask);
         NSString *channelBinding = NXChannelBindingForEndpoint(self.registerEndpoint);
         if (channelBinding.length == 0 && [NXSecurityPolicy requiresServerChain]) {
             completion(NO, NXError(NXAppAttestErrorPinningFailed, @"Pinned TLS channel binding unavailable during delivery-key registration"));
@@ -776,6 +800,20 @@ static NSString *NXChannelBindingForEndpoint(NSString *endpoint) {
                                       clientDataHash:clientDataHash
                                    completionHandler:^(NSData * _Nullable assertion, NSError * _Nullable error) {
             if (error != nil || assertion == nil) {
+                // DCErrorInvalidKey and DCErrorInvalidInput come from devicecheckd, not from the
+                // network: the Secure Enclave no longer holds a usable key under this id (app data
+                // moved, device restored, a different build of the same bundle id installed over
+                // this one). The only other input is the client-data hash, which is always a
+                // 32-byte SHA-256 made here, so at this step InvalidInput means the id too.
+                // Keeping the id would fail every launch forever, so it is reported as "not
+                // registered" - the one signal that lets the chain rebuild the registration once.
+                if ([error.domain isEqualToString:DCErrorDomain] &&
+                    (error.code == DCErrorInvalidKey || error.code == DCErrorInvalidInput)) {
+                    NSLog(@"[AppAttest] Kunci tidak dapat dipakai di Secure Enclave (DCError %ld) - registrasi akan dibangun ulang.", (long)error.code);
+                    completion(nil, NXError(NXAppAttestErrorKeyNotRegistered,
+                                            [NSString stringWithFormat:@"App Attest key unusable on this device (DCError %ld)", (long)error.code]));
+                    return;
+                }
                 completion(nil, error ?: NXError(NXAppAttestErrorAssertFailed, @"Failed to generate assertion"));
                 return;
             }

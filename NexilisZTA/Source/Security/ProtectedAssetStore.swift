@@ -16,25 +16,37 @@ import CryptoKit
 // fails attestation and never gets the key.
 //
 // The file format is deliberately trivial, because a format with options is a format with a
-// downgrade attack in it:
+// downgrade attack in it. It is the Nexilis Sentinel v3.0.1 RC5 SPA1 container, byte for byte,
+// so the RC5 build tool (tools/build_ios_protected_asset.py) and the RC5 server contract apply
+// unchanged:
 //
-//     "NSPA1\0\0\0"  (8 bytes)  ||  AES.GCM combined  (12-byte nonce || ciphertext || 16-byte tag)
+//     "SPA1"  (4 bytes)  ||  12-byte nonce  ||  ciphertext  ||  16-byte GCM tag
+//     AAD = "SENTINEL_IOS_PROTECTED_ASSET_V1"
 //
 // There is one algorithm, one version, and no header field an attacker can edit to ask for
 // something weaker. A blob that does not start with the magic, or whose tag does not verify, is
 // refused — GCM authenticates, so a modified asset fails to open rather than opening as garbage.
+// The AAD ties the ciphertext to this purpose: a GCM blob sealed for anything else under the
+// same key does not open here.
+//
+// This replaced the earlier "NSPA1" layout (8-byte magic, no AAD) before any host shipped an
+// asset, so there is no legacy blob to keep reading.
 //
 // Nothing here writes plaintext anywhere. `withDecryptedAsset` is the API production call sites
 // should use: it scopes the bytes to a closure so a caller does not have to decide where to keep
 // them, which is where "just cache it in Documents" quietly undoes all of the above.
 public enum ProtectedAssetStore {
 
-    /// `NSPA1` and three padding bytes, so the payload that follows starts 8-byte aligned.
-    private static let magic = Data([0x4e, 0x53, 0x50, 0x41, 0x31, 0x00, 0x00, 0x00])
+    /// `SPA1`.
+    private static let magic = Data([0x53, 0x50, 0x41, 0x31])
+    private static let nonceLength = 12
+    private static let tagLength = 16
+    /// What the sealing tool authenticated alongside the ciphertext.
+    private static let additionalData = Data("SENTINEL_IOS_PROTECTED_ASSET_V1".utf8)
 
     /// Smallest blob that could possibly be well-formed: the magic, a 12-byte nonce, a 16-byte
     /// tag, and at least one byte of ciphertext.
-    private static let minimumLength = 8 + 12 + 16 + 1
+    private static let minimumLength = 4 + 12 + 16 + 1
 
     /// AES-256. A delivered key of any other length is a protocol mismatch, not something to try.
     private static let keyLength = 32
@@ -48,6 +60,26 @@ public enum ProtectedAssetStore {
         case missing        = 1
         case invalidKey     = 2
         case invalidFormat  = 3
+    }
+
+    /// Data assets beside the activation asset: `<name>.spa` in the bundle, sealed with the same
+    /// per-app key (tools/build_ios_protected_asset.py), opened by name through
+    /// APISZTA.withProtectedAsset(named:). Kept apart from the Barrier #2 asset so the host's own
+    /// data is never what the activation proof is computed over.
+    public static func protectedAssetURL(named name: String, in bundle: Bundle = .main) throws -> URL {
+        let safe = name.replacingOccurrences(of: ".spa", with: "")
+        guard !safe.isEmpty, !safe.contains("/"), !safe.contains("..") else {
+            throw error(.missing, "protected asset name invalid")
+        }
+        guard let url = bundle.url(forResource: safe, withExtension: "spa") else {
+            throw error(.missing, "protected asset \(safe).spa not in bundle")
+        }
+        return url
+    }
+
+    /// Opens a named data asset; see `protectedAssetURL(named:)`.
+    public static func decrypt(deliveredKey: Data, named name: String, in bundle: Bundle = .main) throws -> Data {
+        try open(Data(contentsOf: protectedAssetURL(named: name, in: bundle), options: [.mappedIfSafe]), key: deliveredKey)
     }
 
     public static func protectedAssetURL(in bundle: Bundle = .main) throws -> URL {
@@ -78,15 +110,22 @@ public enum ProtectedAssetStore {
     /// Prefer `withDecryptedAsset` — this returns the plaintext to a caller who then owns the
     /// problem of not leaving it somewhere.
     public static func decrypt(deliveredKey: Data, in bundle: Bundle = .main) throws -> Data {
+        try open(Data(contentsOf: protectedAssetURL(in: bundle), options: [.mappedIfSafe]), key: deliveredKey)
+    }
+
+    private static func open(_ blob: Data, key deliveredKey: Data) throws -> Data {
         guard deliveredKey.count == keyLength else {
             throw error(.invalidKey, "delivered key must be \(keyLength) bytes")
         }
-        let blob = try Data(contentsOf: protectedAssetURL(in: bundle), options: [.mappedIfSafe])
         guard blob.count >= minimumLength, blob.prefix(magic.count) == magic else {
             throw error(.invalidFormat, "protected asset format invalid")
         }
-        let sealed = try AES.GCM.SealedBox(combined: Data(blob.dropFirst(magic.count)))
-        return try AES.GCM.open(sealed, using: SymmetricKey(data: deliveredKey))
+        let nonceEnd = magic.count + nonceLength
+        let nonce = try AES.GCM.Nonce(data: blob.subdata(in: magic.count ..< nonceEnd))
+        let ciphertext = blob.subdata(in: nonceEnd ..< (blob.count - tagLength))
+        let tag = blob.suffix(tagLength)
+        let sealed = try AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag)
+        return try AES.GCM.open(sealed, using: SymmetricKey(data: deliveredKey), authenticating: additionalData)
     }
 
     /// Scopes the decrypted bytes to the operation that needs them.

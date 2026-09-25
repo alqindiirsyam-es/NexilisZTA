@@ -209,16 +209,40 @@ public enum APISZTA {
                                  showsErrorScreen: Bool = true,
                                  onFailure: ((Error) -> Void)? = nil,
                                  onReady: @escaping () -> Void) {
-        applyConfiguration(configuration, armAppAttest: false)
-
         onMain {
-            self.onReady = onReady
-            self.onFailure = onFailure
-            self.showsErrorScreen = showsErrorScreen
-            self.sessionReady = false
-            self.attempts = 0
-            self.startObservingIfNeeded()
-            self.start()
+            Task { @MainActor in
+                do { try installRILLifecycle(for: configuration) }
+                catch {
+                    self.onFailure = onFailure
+                    self.showsErrorScreen = showsErrorScreen
+                    self.onReady = nil
+                    self.sessionReady = false
+                    self.inFlight = false
+                    self.rilConfigurationRejected = true
+                    self.rilSession?.suspend()
+                    SentinelTelemetryLoop.stop()
+                    NotificationCenter.default.post(name: .ztaSessionError, object: nil, userInfo: ["error": error])
+                    // The layer's own alert, unless the host asked to handle it. A startup
+                    // configuration error is told as soon as anything can show it.
+                    if configuration.showsRILRecoveryUI { RILRecoveryPresenter.shared.configurationFailed(error) }
+                    onFailure?(error)
+                    return
+                }
+                self.rilConfigurationRejected = false
+                if configuration.showsRILRecoveryUI, rilSession != nil { RILRecoveryPresenter.shared.install() }
+                // Modes 1 and 2: nothing of the host is shown before the device is authorized.
+                if configuration.showsSecurityCheckingCover, configuration.appMode != .regular {
+                    SentinelSecurityCover.show()
+                }
+                applyConfiguration(configuration, armAppAttest: false)
+                self.onReady = onReady
+                self.onFailure = onFailure
+                self.showsErrorScreen = showsErrorScreen
+                self.sessionReady = false
+                self.attempts = 0
+                self.startObservingIfNeeded()
+                self.start()
+            }
         }
     }
 
@@ -245,6 +269,9 @@ public enum APISZTA {
                                             backupPin: configuration.backupPin)
         RASPGuard.shared().configureHostPinFloor(configuration.pinnedHostPins)
         AppAttestManager.shared().minimumOSMajor = configuration.minimumAppAttestOSMajor
+        // Every embedded path passes here - configure, the steps driven by hand, SecurityShield
+        // on its own - so each gets the privacy covers the configuration asks for.
+        SentinelPrivacy.install(configuration.privacyShield)
         if armAppAttest {
             AppAttestService.shared.configure()
         }
@@ -258,6 +285,7 @@ public enum APISZTA {
     /// kept it changed nothing.
     public static func retry() {
         onMain {
+            Task { @MainActor in rilSession?.suspend() }
             self.attempts = 0
             AppAttestManager.shared().clearRegistration()
             UserDefaults.standard.removeObject(forKey: "nx_appattest_env")
@@ -312,6 +340,9 @@ public enum APISZTA {
     public static func revokeLocalAuthorization(reason: String = "local security revocation") {
         // First, so nothing wakes up mid-teardown holding a token that is about to stop existing.
         SentinelTelemetryLoop.stop()
+        Task { @MainActor in rilSession?.suspend() }
+        // A revoked authorization takes its activation proof with it.
+        SentinelProtectedRuntimeVerifier.invalidate()
         if AppAttestManager.shared().isRegistered {
             AppAttestManager.shared().clearRegistration()
         }
@@ -407,6 +438,163 @@ public enum APISZTA {
     // the whole difference between the modes: tolerance of being offline, not a thinner set of
     // security controls.
 
+    private static let rilPilotLock = NSLock()
+    private static var rilPilotTransport: RILPilotTransport?
+    // A configuration failure must not enter bootstrap's automatic retry path without the adapter.
+    private static var rejectedRILConfiguration = false
+    private static var rilConfigurationRejected: Bool {
+        get { rilPilotLock.lock(); defer { rilPilotLock.unlock() }; return rejectedRILConfiguration }
+        set { rilPilotLock.lock(); rejectedRILConfiguration = newValue; rilPilotLock.unlock() }
+    }
+
+    /// Separate from ZTA authorization: business-session readiness does not imply RIL readiness.
+    @MainActor public private(set) static var rilSession: RILSession?
+    @MainActor private static var rilConfigurationIdentity: [String]?
+    @MainActor private static var rilWipeObserver: NSObjectProtocol?
+
+    /// configure(_:) calls this before startup. Hosts using only applyConfiguration must call
+    /// this explicitly before starting their own chain, then sessionAuthorized() after authorization.
+    @MainActor public static func installRILLifecycle(for config: NexilisZTAConfiguration) throws {
+        // An explicit configuration wins; otherwise the host's Info.plist declares the opt-in.
+        // A plist that is present and wrong throws here, into configure()'s failure path.
+        let declared: RILConfiguration?
+        var settings: [String: Any]?
+        if let explicit = config.ril {
+            declared = explicit
+            settings = config.rilSettings
+                ?? config.rilInfoPlistKey.flatMap { Bundle.main.object(forInfoDictionaryKey: $0) as? [String: Any] }
+        } else if let given = config.rilSettings {
+            declared = try RILConfiguration.from(settings: given, sentinel: config)
+            settings = given
+        } else if let key = config.rilInfoPlistKey {
+            declared = try RILConfiguration.fromInfoPlist(key: key, sentinel: config)
+            settings = Bundle.main.object(forInfoDictionaryKey: key) as? [String: Any]
+        } else {
+            declared = nil
+        }
+        let protection = try config.rilProtection ?? settings.flatMap { try RILProtection.from(settings: $0) }
+        guard let ril = declared else {
+            // Protection asked for without RIL itself: a build that declared it must not start
+            // quietly without it.
+            guard rilSession == nil, protection == nil else { throw RILError.invalidConfiguration }
+            return
+        }
+        guard ril.challengeURL.absoluteString == config.challengeEndpoint,
+              let pack = URL(string: config.securityPackEndpoint),
+              let telemetry = URL(string: config.telemetryEndpoint) else { throw RILError.invalidConfiguration }
+        let routes = try RILPilotRoutes(origin: ril.origin, securityPackURL: pack, telemetryURL: telemetry)
+        let identity = [ril.scope, ril.bundleID, ril.challengeURL.absoluteString, ril.enrollmentURL.absoluteString,
+                        config.securityPackEndpoint, config.telemetryEndpoint,
+                        String(ril.policy.maxBodyBytes), String(ril.policy.lifetimeSeconds)]
+        if rilSession != nil {
+            guard rilConfigurationIdentity == identity else { throw RILError.invalidConfiguration }
+            return
+        }
+        if let protection {
+            RILProtectionRegistry.shared.configure(protection, ztaBaseURL: config.baseURL)
+            RILProtectionInstaller.install()
+        }
+        let session = RILSession(client: RILClient(configuration: ril))
+        try installRILPilotTransport(RILPilotTransport(session: session, routes: routes))
+        session.onStateChange = { state in
+            NotificationCenter.default.post(name: Notification.Name("io.nexilis.ril.stateChanged"),
+                                            object: nil, userInfo: ["state": state.rawValue])
+            if state == .failed, case RILError.registrationChanged? = session.lastError, !rilRegistrationRecoveryTried {
+                // Marked at once, before the task runs: a request in between waits instead of failing.
+                isRecoveringRILRegistration = true
+                Task { @MainActor in await recoverRILRegistration() }
+            }
+        }
+        rilSession = session; rilConfigurationIdentity = identity
+        rilWipeObserver = NotificationCenter.default.addObserver(forName: .ztaHardWipeRequested,
+            object: nil, queue: .main) { _ in
+            Task { @MainActor in
+                SentinelTelemetryLoop.stop()
+                // Errors remain visible through rilSession.lastError; do not report deletion success.
+                do { try await session.clearLocalKeys() } catch { }
+            }
+        }
+    }
+
+    /// Once per launch: the local RIL key is bound to an App Attest registration this install no longer
+    /// has, so it can never sign again - it is cleared and a fresh key enrolled, without asking the user.
+    /// The key it clears is already unusable; nothing that still works is thrown away. Should the fresh
+    /// enrollment fail for another reason, the usual recovery alert takes over.
+    @MainActor private static var rilRegistrationRecoveryTried = false
+    /// True while that re-enrollment runs: protected requests wait for it rather than fail.
+    @MainActor static var isRecoveringRILRegistration = false
+    @MainActor static func recoverRILRegistration() async {
+        defer { isRecoveringRILRegistration = false }
+        guard !rilRegistrationRecoveryTried, rilSession != nil, currentAuthorizationToken != nil else { return }
+        rilRegistrationRecoveryTried = true
+        print("[RIL] registrasi App Attest berganti - kunci RIL lama dihapus dan didaftarkan ulang otomatis")
+        do {
+            try await clearRILLocalKeys()
+            try await retryRILEnrollment()
+            print("[RIL] pendaftaran ulang otomatis berhasil")
+        } catch {
+            print("[RIL] pendaftaran ulang otomatis gagal: \(error)")
+        }
+    }
+
+    /// Retry only on an explicit recovery decision, never as a response to every RIL 403.
+    @MainActor public static func retryRILEnrollment() async throws {
+        guard let session = rilSession, currentAuthorizationToken != nil else { throw RILError.sessionUnavailable }
+        try await session.retryEnrollment()
+        guard currentAuthorizationToken != nil else { session.suspend(); throw RILError.sessionUnavailable }
+        SentinelTelemetryLoop.start()
+        refreshSecurityIntelligence()
+    }
+
+    /// Host logout integration: revoke ZTA separately, then await local RIL deletion.
+    @MainActor public static func clearRILLocalKeys() async throws {
+        SentinelTelemetryLoop.stop()
+        try await rilSession?.clearLocalKeys()
+    }
+
+    /// Install once before starting Sentinel polling. Enrollment/lifecycle remain host-owned.
+    /// No runtime disable API: signing failure must never silently downgrade to unsigned.
+    public static func installRILPilotTransport(_ transport: RILPilotTransport) throws {
+        rilPilotLock.lock(); defer { rilPilotLock.unlock() }
+        guard rilPilotTransport == nil else { throw RILError.invalidConfiguration }
+        rilPilotTransport = transport
+    }
+
+    /// A failed signed POST can have reached the collector. Host recovery must reconcile delivery
+    /// or explicitly discard the pending buffer before resuming; timers cannot reset this latch.
+    public static var isRILTelemetrySuspended: Bool {
+        telemetryLock.lock(); defer { telemetryLock.unlock() }
+        return rilTelemetrySuspended
+    }
+
+    public static func resumeRILTelemetryAfterReconciliation() {
+        telemetryLock.lock(); defer { telemetryLock.unlock() }
+        rilTelemetrySuspended = false
+    }
+
+    private static func sendPilotRequest(_ request: URLRequest,
+        completion: @escaping (Data?, URLResponse?, Error?, Bool) -> Void) {
+        rilPilotLock.lock()
+        let transport = rilPilotTransport
+        rilPilotLock.unlock()
+        guard let transport else {
+            pinnedSession.dataTask(with: request) { data, response, error in
+                completion(data, response, error, false)
+            }.resume()
+            return
+        }
+        Task {
+            do {
+                let (data, response) = try await transport.send(request)
+                // Conservatively suspend failed telemetry, including 4xx: no automatic retry
+                // until server-side event deduplication and recovery have been integrated.
+                completion(data, response, nil, !(200...299).contains(response.statusCode))
+            } catch {
+                completion(nil, nil, error, error is RILPilotError)
+            }
+        }
+    }
+
     /// Fetches the independently signed policy pack over the pinned channel.
     ///
     /// A failed fetch cannot grant trust and cannot clear policy: the pack already in force stays
@@ -425,7 +613,7 @@ public enum APISZTA {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(token, forHTTPHeaderField: "X-Nexilis-ZTA-Session")
 
-        pinnedSession.dataTask(with: request) { data, response, error in
+        sendPilotRequest(request) { data, response, error, _ in
             guard error == nil, (response as? HTTPURLResponse)?.statusCode == 200, let data,
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 completion?(false)
@@ -443,7 +631,7 @@ public enum APISZTA {
             }
             submitThreatTelemetry()
             completion?(applied)
-        }.resume()
+        }
     }
 
     /// Sends normalized security evidence.
@@ -461,7 +649,7 @@ public enum APISZTA {
         // Two timers reach this now — the five-minute evidence loop and the fifteen-minute status
         // poll's chained refresh — and a batch is not removed from the buffer until the server
         // acknowledges it. Without this, two calls that overlap send the same evidence twice.
-        let allowed = now >= telemetryNextAttempt && !telemetryInFlight
+        let allowed = now >= telemetryNextAttempt && !telemetryInFlight && !rilTelemetrySuspended
         if allowed { telemetryInFlight = true }
         telemetryLock.unlock()
         guard allowed else { return }
@@ -488,7 +676,7 @@ public enum APISZTA {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(token, forHTTPHeaderField: "X-Nexilis-ZTA-Session")
 
-        pinnedSession.dataTask(with: request) { _, response, error in
+        sendPilotRequest(request) { _, response, error, uncertain in
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if error == nil, (200...299).contains(code) {
                 SentinelTelemetryBuffer.ack(events)
@@ -499,6 +687,7 @@ public enum APISZTA {
                 telemetryLock.unlock()
             } else {
                 telemetryLock.lock()
+                if uncertain { rilTelemetrySuspended = true }
                 telemetryFailures = min(6, telemetryFailures + 1)
                 let delay = min(15 * 60.0, 30.0 * pow(2.0, Double(min(5, telemetryFailures - 1))))
                 telemetryNextAttempt = Date().timeIntervalSince1970 + delay
@@ -509,13 +698,72 @@ public enum APISZTA {
             // means the server acted on the evidence, so the device stops holding an authorization
             // the server has already withdrawn.
             if code == 401 { revokeLocalAuthorization(reason: "server rejected threat telemetry authorization") }
-        }.resume()
+        }
     }
 
     private static let telemetryLock = NSLock()
     private static var telemetryFailures = 0
     private static var telemetryNextAttempt: TimeInterval = 0
     private static var telemetryInFlight = false
+    private static var rilTelemetrySuspended = false
+
+    // MARK: - Sentinel Vault
+
+    /// A server/HSM operation over a payload the user already authorized - a signature or a MAC
+    /// for a sensitive transaction - performed with a key the device never holds.
+    ///
+    /// `decisionToken` and `semanticSHA256` come from `authorizeSensitiveTransactionJSON`; the
+    /// service consumes that decision here, so it authorizes exactly one operation, and a
+    /// relying party that receives the result does not call `/zta/decision/verify` for it as
+    /// well. A 401/403 revokes the local authorization: the session is what the Vault trusted.
+    public static func performVaultOperation(purpose: String,
+                                             algorithm: String,
+                                             payload: Data,
+                                             semanticSHA256: String,
+                                             decisionToken: String,
+                                             completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        func failWith(_ code: Int, _ message: String) {
+            completion(.failure(NSError(domain: SentinelVaultClient.errorDomain, code: code,
+                                        userInfo: [NSLocalizedDescriptionKey: message])))
+        }
+        guard NXSecurityPolicy.requiresServerChain(), let token = currentAuthorizationToken else {
+            failWith(1, "A live Sentinel authorization at app mode 1 or 2 is required for a Vault operation."); return
+        }
+        let root = configuration.baseURL.hasSuffix("/") ? configuration.baseURL : configuration.baseURL + "/"
+        guard let url = URL(string: root + "zta/vault/operate") else { failWith(2, "Invalid Vault endpoint."); return }
+        let body = SentinelVaultClient.makeRequest(purpose: purpose, algorithm: algorithm, payload: payload,
+                                                   semanticSHA256: semanticSHA256, decisionToken: decisionToken)
+        guard JSONSerialization.isValidJSONObject(body),
+              let bytes = try? JSONSerialization.data(withJSONObject: body) else {
+            failWith(3, "Invalid Vault request."); return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.httpMethod = "POST"
+        request.httpBody = bytes
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(token, forHTTPHeaderField: "X-Nexilis-ZTA-Session")
+        request.setValue(SecurityAuditChain.headHash(), forHTTPHeaderField: "X-Nexilis-Audit-Head")
+        pinnedSession.dataTask(with: request) { data, response, error in
+            if let error { completion(.failure(error)); return }
+            guard let http = response as? HTTPURLResponse, let data else {
+                failWith(4, "Vault response unavailable."); return
+            }
+            let object = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            guard http.statusCode == 200,
+                  (object["ok"] as? Bool) == true,
+                  (object["key_exported"] as? Bool) == false else {
+                if http.statusCode == 401 || http.statusCode == 403 {
+                    revokeLocalAuthorization(reason: "server rejected Vault authorization")
+                }
+                let reason = (object["error"] as? String) ?? "HTTP \(http.statusCode)"
+                failWith(http.statusCode, "Vault operation denied: \(reason)"); return
+            }
+            SecurityAuditChain.append(event: "vault_operation_completed",
+                                      detail: ["purpose": purpose, "algorithm": algorithm])
+            completion(.success(object))
+        }.resume()
+    }
 
     /// Obtains a one-time, transaction-bound decision for a business payload.
     ///
@@ -722,7 +970,8 @@ public enum APISZTA {
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
                                                object: nil,
                                                queue: .main) { _ in
-            guard !sessionReady, attempts > 0, !inFlight else { return }
+            // Not once the error screen is up: that failure is final and the screen closes the app.
+            guard !sessionReady, attempts > 0, !inFlight, !failedFinally else { return }
             attempts = 0
             start()
         }
@@ -751,11 +1000,17 @@ public enum APISZTA {
     // MARK: - The chain
 
     private static func start() {
+        guard !rilConfigurationRejected else { return }
         guard !inFlight else {
             NXLogger.appAttest.publicInfo("[AppAttest] Chain sudah berjalan, permintaan diabaikan.")
             return
         }
         inFlight = true
+        // Barrier #1: every verification attempt earns network access again from a fresh
+        // offline pass. Closed here, opened only by SentinelOfflinePreflight.run below.
+        RASPGuard.shared().invalidateOfflinePreflight()
+        // Barrier #2 likewise: a proof belongs to one activation, and this is a new one.
+        SentinelProtectedRuntimeVerifier.invalidate()
 
         // The chain is a sequence of callbacks across DeviceCheck, the Secure Enclave and five
         // network round trips. If any one of them never calls back, the flag above would stay
@@ -805,6 +1060,10 @@ public enum APISZTA {
             // still decides whether attestation applies, and a launch with no network still
             // opens the session rather than parking the host behind a screen it cannot pass.
             NXLogger.appAttest.publicInfo("Certificate pinning: enabled (regular mode)")
+            // Barrier #1 at .regular: the probes run and the evidence is recorded and reported
+            // with the attestation, but a finding does not block - run() opens the latch anyway
+            // at this mode, so it cannot throw here.
+            _ = try? SentinelOfflinePreflight.run(configuration: config)
             guard ZTAReachability.isConnected else {
                 stateSet(NX_STATE_APPATTEST_KEY_DELIVERY)
                 finish()
@@ -926,6 +1185,18 @@ public enum APISZTA {
         // at these modes, so the only flag the answer carries - `device_check_attestation` - is
         // already known not to be read. At .regular the fetch stays exactly where it was, because
         // there the answer decides whether attestation happens at all.
+        //
+        // Barrier #1: the complete offline preflight, and the only thing that opens the network
+        // latch. Everything above was a precondition read from configuration and launch state;
+        // this re-runs the native RASP set and the local probes against the device as it is now.
+        // A finding fails the chain closed - the service is never contacted with it.
+        do {
+            try SentinelOfflinePreflight.run(configuration: config)
+        } catch {
+            fail(error)
+            return
+        }
+
         AppAttestService.shared.configure()
         startAttestFlow()
     }
@@ -1056,7 +1327,136 @@ public enum APISZTA {
         // `tries` starts over here, and that is the intended budget: a registration that was just
         // rebuilt gets its own three transport retries. `attempt` is what stops the recursion -
         // it is already 1 on that path, so the second exhaustion fails instead of rebuilding again.
-        deliverKey(attempt: attempt)
+        authenticateUserThenDeliverKey(attempt: attempt)
+    }
+
+    // MARK: - Bootstrap user authentication
+
+    /// Institution user authentication between attestation and key delivery (Sentinel v3.0.1).
+    ///
+    /// The device has proved what it is; before the service hands it a key, the person has to
+    /// prove who they are. The host's `bootstrapAuthentication` provider produces the IdP
+    /// assertion, `/zta/bootstrap/auth` consumes it once and returns a short-lived user
+    /// credential, and `/key` is asked for only with that credential in hand. A credential that
+    /// is still live is reused - a retry of the chain does not put the sign-in up again.
+    ///
+    /// No provider: the chain runs as it always has, unless the host declared
+    /// `userAuthenticationRequired`, in which case a mode-1/2 chain without a provider is a
+    /// misconfiguration and stops here.
+    /// Set once `/zta/bootstrap/auth` accepted a sign-in in this process (`userAuthenticationPerLaunch`).
+    private static var userAuthenticatedThisLaunch = false
+
+    private static func authenticateUserThenDeliverKey(attempt: Int) {
+        let config = configuration
+        guard let provider = config.bootstrapAuthentication else {
+            if config.userAuthenticationRequired, NXSecurityPolicy.requiresServerChain() {
+                fail(NSError(domain: NXAppAttestErrorDomain, code: -7010,
+                             userInfo: [NSLocalizedDescriptionKey: "Bootstrap user authentication provider is required before protected key delivery."]))
+                return
+            }
+            deliverKey(attempt: attempt)
+            return
+        }
+        if SessionManager.shared().hasValidUserAuth,
+           !config.userAuthenticationPerLaunch || userAuthenticatedThisLaunch {
+            deliverKey(attempt: attempt)
+            return
+        }
+        guard let keyID = AppAttestService.shared.keyId, !keyID.isEmpty else {
+            fail(NSError(domain: NXAppAttestErrorDomain, code: -7011,
+                         userInfo: [NSLocalizedDescriptionKey: "App Attest registration is required before user authentication."]))
+            return
+        }
+        let armed = generation
+        provider(keyID) { result in
+            onMain {
+                guard generation == armed, !sessionReady else { return }
+                switch result {
+                case .failure(let error):
+                    // The first assertion of a mode-1/2 chain is the install token's, made inside the
+                    // provider. A key the Secure Enclave no longer holds (DCError 2/3: a different build
+                    // installed over this one, app data moved) surfaces here as keyNotRegistered, and
+                    // failing with it kept the same dead key id for every retry and every launch. The
+                    // same remedy as key delivery's: drop the registration and register afresh, once.
+                    if attempt == 0, (error as NSError).domain == NXAppAttestErrorDomain,
+                       (error as NSError).code == NXAppAttestError.keyNotRegistered.rawValue {
+                        NXLogger.appAttest.publicError(
+                            "[AppAttest] Kunci App Attest tidak lagi dapat dipakai sebelum sign-in - registrasi dibuang, mendaftar ulang.")
+                        SecurityAuditChain.append(event: "appattest_registration_rebuilt",
+                                                  detail: ["stage": "bootstrap_authentication"])
+                        AppAttestManager.shared().clearRegistration()
+                        UserDefaults.standard.removeObject(forKey: "nx_appattest_env")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            guard generation == armed, !sessionReady else { return }
+                            AppAttestService.shared.configure()
+                            registerThenAssertThenDeliverKey(attempt: 1)
+                        }
+                        return
+                    }
+                    fail(error)
+                case .success(let assertion):
+                    exchangeIdPAssertion(assertion, keyID: keyID, attempt: attempt)
+                }
+            }
+        }
+    }
+
+    private static func exchangeIdPAssertion(_ assertion: String, keyID: String, attempt: Int) {
+        let trimmed = assertion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            fail(NSError(domain: NXAppAttestErrorDomain, code: -7011,
+                         userInfo: [NSLocalizedDescriptionKey: "Institution authentication returned an empty assertion."]))
+            return
+        }
+        do { try SentinelOfflinePreflight.requireNetworkAllowed() } catch { fail(error); return }
+        let endpoint = configuration.bootstrapAuthEndpoint
+        guard let url = URL(string: endpoint) else {
+            fail(NSError(domain: NXAppAttestErrorDomain, code: -7012,
+                         userInfo: [NSLocalizedDescriptionKey: "Invalid bootstrap authentication endpoint."]))
+            return
+        }
+        // The channel this assertion travels, so the service can refuse one relayed from
+        // elsewhere - the same binding every other ZTA request carries. Absent until the pinned
+        // session has connected once at these modes, which attestation has already done.
+        let channel = RASPGuard.shared().pinnedLeafSPKI(forEndpoint: endpoint) ?? ""
+        var body: [String: Any] = ["key_id": keyID, "idp_assertion": trimmed, "platform": "ios"]
+        if !channel.isEmpty { body["tls_spki"] = channel }
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+            fail(NSError(domain: NXAppAttestErrorDomain, code: -7012,
+                         userInfo: [NSLocalizedDescriptionKey: "Invalid bootstrap authentication request."]))
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "POST"
+        request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let armed = generation
+        pinnedSession.dataTask(with: request) { data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            guard error == nil, status == 200,
+                  let token = json["user_auth_token"] as? String, !token.isEmpty,
+                  let exp = (json["expires_at_ms"] as? NSNumber)?.doubleValue,
+                  exp > Date().timeIntervalSince1970 * 1000 else {
+                let reason = (json["error"] as? String) ?? error?.localizedDescription ?? "HTTP \(status)"
+                onMain {
+                    guard generation == armed, !sessionReady else { return }
+                    fail(error ?? NSError(domain: NXAppAttestErrorDomain, code: -7013,
+                                          userInfo: [NSLocalizedDescriptionKey: "Server rejected bootstrap user authentication: \(reason)"]))
+                }
+                return
+            }
+            SessionManager.shared().storeUserAuthToken(token, expiresAt: Date(timeIntervalSince1970: exp / 1000))
+            onMain { userAuthenticatedThisLaunch = true }
+            SecurityAuditChain.append(event: "bootstrap_user_authenticated",
+                                      detail: ["account_binding_sha256": json["account_binding_sha256"] ?? "",
+                                               "expires_at_ms": Int64(exp)])
+            NXLogger.appAttest.publicInfo("[Bootstrap] Institution user authentication accepted; key delivery may proceed.")
+            onMain {
+                guard generation == armed, !sessionReady else { return }
+                deliverKey(attempt: attempt)
+            }
+        }.resume()
     }
 
     /// Whether a failed key delivery is worth sending again over the same registration.
@@ -1104,6 +1504,20 @@ public enum APISZTA {
             // delegate raises when it rejects a chain all land here, unretried, on purpose.
             return false
         }
+    }
+
+    /// The one verdict that justifies discarding a registration: the service said it does not
+    /// hold it. `keyNotRegistered` is the mapped code; the raw refusal text is accepted too, for
+    /// a service older than the mapping.
+    private static func keyDeliveryRegistrationInvalid(_ error: Error?) -> Bool {
+        guard let error = error as NSError? else { return false }
+        guard error.domain == NXAppAttestErrorDomain else { return false }
+        if error.code == NXAppAttestError.keyNotRegistered.rawValue { return true }
+        if error.code == NXAppAttestError.serverRejected.rawValue {
+            let text = error.localizedDescription.lowercased()
+            return text.contains("not registered") || text.contains("unknown key")
+        }
+        return false
     }
 
     /// Failures that say something about the *channel*, never about the registration.
@@ -1215,13 +1629,33 @@ public enum APISZTA {
                     return
                 }
 
-                // Two ways here, and both point at the registration rather than the link: three
-                // transport retries all failed while the channel held, or the server named a fault
-                // no retry can clear - `keyNotRegistered` above all, which is precisely what a
-                // rebuild fixes. Allowed exactly once; `attempt` is what makes that true.
+                // Fix: a registration is rebuilt only when the service has *said* it no longer
+                // holds one - `keyNotRegistered`, which is what "device not registered" maps to.
+                // It used to be rebuilt after three exhausted transport retries too, and after any
+                // refusal the service gave - a flaky link, a restarted backend, an "unknown
+                // challenge" - so a working Secure Enclave key was thrown away on signals that
+                // said nothing about it, and the App Attest key id changed under an install that
+                // was never uninstalled. Anything else is the link's or the service's problem:
+                // at .regular the session opens offline, the way it does with no network at all,
+                // and the next launch tries again; at .hsa/.middle it parks and retries.
+                guard keyDeliveryRegistrationInvalid(error) else {
+                    if !NXSecurityPolicy.requiresServerChain() {
+                        NXLogger.appAttest.publicInfo(
+                            "[AppAttest] Key delivery tidak selesai (\(error?.localizedDescription ?? "?")) - mode 3 masuk offline, registrasi dipertahankan.")
+                        print("[AppAttest] Key delivery tidak selesai - mode 3 masuk offline, registrasi dipertahankan (keyId tetap).")
+                        SecurityAuditChain.append(event: "key_delivery_deferred_offline",
+                                                  detail: ["tries": tries, "reason": error?.localizedDescription ?? ""])
+                        stateSet(NX_STATE_APPATTEST_KEY_DELIVERY)
+                        finish()
+                    } else {
+                        fail(error)
+                    }
+                    return
+                }
+                // Allowed exactly once; `attempt` is what makes that true.
                 guard attempt == 0 else { fail(error); return }
                 NXLogger.appAttest.publicError(
-                    "[AppAttest] Key delivery gagal setelah \(tries)x - registrasi dibuang, mendaftar ulang.")
+                    "[AppAttest] Service tidak lagi mengenal registrasi ini - registrasi dibuang, mendaftar ulang.")
                 SecurityAuditChain.append(event: "appattest_registration_rebuilt",
                                           detail: ["key_delivery_tries": tries])
                 AppAttestManager.shared().clearRegistration()
@@ -1235,6 +1669,21 @@ public enum APISZTA {
                 return
             }
             NXLogger.appAttest.publicInfo("[AppAttest] ✅ Server-verified key delivery complete (\(key.count) bytes).")
+
+            // Barrier #2: the key opens the protected asset, and the independent verifier runs
+            // over the decrypted bytes before anything is called ready. The plaintext is scoped
+            // to that call and zeroed on the way out; the key is the service's to deliver again
+            // when the host asks for the asset itself.
+            do {
+                try SentinelProtectedRuntimeVerifier.activate(deliveredKey: key, configuration: configuration)
+            } catch {
+                NXLogger.appAttest.publicError("[Barrier2] Protected re-verification gagal: \(error.localizedDescription)")
+                fail(error)
+                return
+            }
+            if SentinelProtectedRuntimeVerifier.isVerified {
+                NXLogger.appAttest.publicInfo("[Barrier2] Protected post-decrypt re-verification PASS.")
+            }
             finish()
         }
     }
@@ -1243,6 +1692,7 @@ public enum APISZTA {
 
     /// The one way out that lets the host start its session.
     private static func finish() {
+        guard !rilConfigurationRejected else { return }
         guard stateGet() == NX_STATE_APPATTEST_KEY_DELIVERY else {
             // Fix: the domain was a sentence and the code was the internal state, so what reached
             // the screen and the support inbox was neither a domain nor a code anybody could act
@@ -1270,13 +1720,29 @@ public enum APISZTA {
                              userInfo: [NSLocalizedDescriptionKey: "Terminal ZTA state reached without a live server authorization token."]))
                 return
             }
+            // Bootstrap user authentication, where the host configured it: readiness is impossible
+            // without both the server session and a live user credential.
+            if configuration.bootstrapAuthentication != nil || configuration.userAuthenticationRequired,
+               !SessionManager.shared().hasValidUserAuth {
+                fail(NSError(domain: NXAppAttestErrorDomain, code: -7014,
+                             userInfo: [NSLocalizedDescriptionKey: "Terminal ZTA state reached without a live user authentication credential."]))
+                return
+            }
+            // Barrier #2 where the mode requires it: no proof for this activation, no readiness.
+            // `activate` has already thrown on a failed verification; this catches a chain that
+            // reached the end without ever running it.
+            if SentinelProtectedRuntimeVerifier.isRequired, !SentinelProtectedRuntimeVerifier.isVerified {
+                fail(NSError(domain: SentinelProtectedRuntimeVerifier.errorDomain, code: -7429,
+                             userInfo: [NSLocalizedDescriptionKey: "Terminal ZTA state reached without a protected runtime re-verification proof."]))
+                return
+            }
         }
 
         onMain {
             // Once. A watchdog that released an earlier chain can leave two of them running, and
             // the host must not be told to start its session twice - that is a second APIS.connect
             // on a connection that already exists.
-            guard !sessionReady else { return }
+            guard !sessionReady, !rilConfigurationRejected else { return }
 
             // The chain reached its end; the next request is free to start a new one.
             inFlight = false
@@ -1289,10 +1755,17 @@ public enum APISZTA {
             // Evidence keeps its own cadence, five minutes against the status poll's fifteen. A
             // policy that is a quarter of an hour stale is fine; a compromise that is a quarter of
             // an hour unreported is not.
-            SentinelTelemetryLoop.start()
+            Task { @MainActor in
+                if let session = rilSession {
+                    guard currentAuthorizationToken != nil else { return }
+                    do { try await session.sessionAuthorized() } catch { return }
+                    guard currentAuthorizationToken != nil else { session.suspend(); return }
+                }
+                SentinelTelemetryLoop.start()
+                refreshSecurityIntelligence()
+            }
             // First pack fetch of this session. It runs after `sessionReady` is set, so it can
             // only ever be a later packet than the attestation that authorised it.
-            refreshSecurityIntelligence()
 
             // A retry can succeed while the error screen is still up - the automatic one that runs
             // when the app comes back to the foreground, for instance. Without this the reader is
@@ -1302,6 +1775,7 @@ public enum APISZTA {
             ZTAErrorViewController.resetAutomaticRetryBudget()
 
             NotificationCenter.default.post(name: .ztaSessionReady, object: nil)
+            MainActor.assumeIsolated { SentinelSecurityCover.hide() }
             onReady?()
         }
     }
@@ -1350,6 +1824,8 @@ public enum APISZTA {
                                             object: nil,
                                             userInfo: ["error": reported])
             presentErrorScreen(for: reported)
+            // Without the layer's error screen the host shows its own failure: it must be seen.
+            if !showsErrorScreen { MainActor.assumeIsolated { SentinelSecurityCover.hide() } }
             onFailure?(reported)
         }
     }
@@ -1364,7 +1840,7 @@ public enum APISZTA {
 
         func poll() {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard !sessionReady else {
+                guard !sessionReady, !failedFinally else {
                     waitingForNetwork = false
                     return
                 }
@@ -1385,6 +1861,10 @@ public enum APISZTA {
 
     // MARK: - The failure screen
 
+    /// Set once the error screen is up. From then on nothing restarts the chain by itself - the
+    /// foreground observer and the network wait both stand down - and the screen closes the app.
+    private static var failedFinally = false
+
     private static func presentErrorScreen(for error: Error, attempt: Int = 0) {
         guard showsErrorScreen else { return }
         guard let host = topViewController() else {
@@ -1399,9 +1879,9 @@ public enum APISZTA {
         // Hindari double present jika ZTAErrorViewController sudah tampil.
         guard !(host is ZTAErrorViewController) else { return }
 
-        let screen = ZTAErrorViewController(error: error) {
-            host.dismiss(animated: true) { retry() }
-        }
+        // No retry from the screen: it counts down and closes the app.
+        failedFinally = true
+        let screen = ZTAErrorViewController(error: error)
         screen.modalPresentationStyle = .overFullScreen
         screen.modalTransitionStyle = .crossDissolve
         host.present(screen, animated: true)
@@ -1412,7 +1892,7 @@ public enum APISZTA {
         top.dismiss(animated: false)
     }
 
-    private static func topViewController() -> UIViewController? {
+    static func topViewController() -> UIViewController? {
         let scene = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first { $0.activationState == .foregroundActive }
@@ -1433,8 +1913,12 @@ public enum APISZTA {
     /// One session for the feature-access call, pinned the same way every other ZTA request is.
     private static let pinnedSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.timeoutIntervalForRequest = 15
         configuration.timeoutIntervalForResource = 30
+        // Barrier #1: behind the same latch as every other SDK session.
+        configuration.protocolClasses = [SentinelOfflineGateURLProtocol.self] + (configuration.protocolClasses ?? [])
         return URLSession(configuration: configuration,
                           delegate: PinnedURLSessionDelegate(),
                           delegateQueue: nil)

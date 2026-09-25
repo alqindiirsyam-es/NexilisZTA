@@ -23,22 +23,15 @@ public class ZTAErrorViewController: UIViewController {
 
     // MARK: - Properties
     private let error: Error?
-    private var onRetry: (() -> Void)?
-    /// Whether this screen still owes the reader one attempt of its own.
-    private var automaticRetryPending = false
-    /// How long the screen waits before trying once by itself.
-    private static let automaticRetryDelay: TimeInterval = 15
-    /// Automatic attempts left across every appearance of this screen, not just this instance. A
-    /// failure the server means permanently - it does not accept this build, this team, this
-    /// device - fails again every time, and a screen that re-arms itself on each appearance would
-    /// hammer the server forever on a reader's behalf and never tell them anything new. The button
-    /// below is never limited; only the trying-by-itself is.
-    private static var automaticRetryBudget = 3
+    /// A failed verification ends the app: the screen says why, counts down and closes it. There is
+    /// no retry from here - not by a button, not by a timer - so a device the chain refused cannot
+    /// keep knocking until something gives.
+    private static let exitCountdownSeconds = 5
+    private var exitSecondsLeft = ZTAErrorViewController.exitCountdownSeconds
+    private var exitTimer: Timer?
 
-    /// Called once a session finally comes up, so the next bad patch starts with a full budget.
-    public static func resetAutomaticRetryBudget() {
-        automaticRetryBudget = 3
-    }
+    /// Kept for source compatibility; the screen no longer retries, so there is no budget to reset.
+    public static func resetAutomaticRetryBudget() {}
 
     // MARK: - UI Components
     private let scrollView: UIScrollView = {
@@ -92,13 +85,14 @@ public class ZTAErrorViewController: UIViewController {
         return label
     }()
 
-    private let retryButton: UIButton = {
+    private let exitButton: UIButton = {
         let button = UIButton(type: .system)
-        button.setTitle("Coba Lagi", for: .normal)
-        button.setImage(UIImage(systemName: "arrow.clockwise"), for: .normal)
+        button.setTitle("Keluar (\(ZTAErrorViewController.exitCountdownSeconds))", for: .normal)
+        button.setImage(UIImage(systemName: "xmark.circle"), for: .normal)
         button.tintColor = .white
         button.setTitleColor(.white, for: .normal)
-        button.backgroundColor = UIColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 1)
+        button.titleLabel?.font = UIFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        button.backgroundColor = UIColor(red: 0.85, green: 0.25, blue: 0.25, alpha: 1)
         button.layer.cornerRadius = 14
         button.contentEdgeInsets = UIEdgeInsets(top: 14, left: 28, bottom: 14, right: 28)
         button.semanticContentAttribute = .forceLeftToRight
@@ -127,11 +121,13 @@ public class ZTAErrorViewController: UIViewController {
     }()
 
     // MARK: - Init
+    /// `onRetry` is ignored: the screen exits the app instead of retrying. Kept so existing callers build.
     public init(error: Error?, onRetry: (() -> Void)? = nil) {
         self.error = error
-        self.onRetry = onRetry
         super.init(nibName: nil, bundle: nil)
     }
+
+    deinit { exitTimer?.invalidate() }
 
     required init?(coder: NSCoder) {
         self.error = nil
@@ -150,27 +146,35 @@ public class ZTAErrorViewController: UIViewController {
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         runEntryAnimation()
-        scheduleAutomaticRetry()
+        startExitCountdown()
     }
 
-    /// Tries once more without being asked. A busy backend or a minute of bad signal fixes itself,
-    /// and until now the only thing that noticed was the reader swiping the app away and opening
-    /// it again - so the app made them do by hand what it could have done by itself. Exactly one
-    /// attempt, and only where an attempt makes sense: a device that cannot do App Attest at all
-    /// will not do it in fifteen seconds either.
-    private func scheduleAutomaticRetry() {
-        guard !retryButton.isHidden, !automaticRetryPending else { return }
-        guard ZTAErrorViewController.automaticRetryBudget > 0 else {
-            NXLogger.appAttest.publicInfo("[AppAttest] Jatah percobaan otomatis habis - menunggu pembaca.")
-            return
+    /// Five seconds to read the reason, then the app closes. Started once; a second appearance
+    /// (the screen re-presented over a new host) keeps the countdown already running.
+    private func startExitCountdown() {
+        guard exitTimer == nil else { return }
+        NXLogger.appAttest.publicInfo("[AppAttest] Verifikasi gagal - aplikasi ditutup dalam \(exitSecondsLeft) detik.")
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.exitSecondsLeft -= 1
+            if self.exitSecondsLeft <= 0 { self.exitApp() } else { self.updateExitTitle() }
         }
-        ZTAErrorViewController.automaticRetryBudget -= 1
-        automaticRetryPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + ZTAErrorViewController.automaticRetryDelay) { [weak self] in
-            guard let self = self, self.automaticRetryPending, self.viewIfLoaded?.window != nil else { return }
-            self.automaticRetryPending = false
-            self.performRetry()
+        RunLoop.main.add(timer, forMode: .common)
+        exitTimer = timer
+    }
+
+    private func updateExitTitle() {
+        UIView.performWithoutAnimation {
+            exitButton.setTitle("Keluar (\(exitSecondsLeft))", for: .normal)
+            exitButton.layoutIfNeeded()
         }
+    }
+
+    private func exitApp() {
+        exitTimer?.invalidate()
+        exitTimer = nil
+        NXLogger.appAttest.publicInfo("[AppAttest] Aplikasi ditutup setelah verifikasi gagal.")
+        exit(0)
     }
 
     // MARK: - Background
@@ -193,7 +197,7 @@ public class ZTAErrorViewController: UIViewController {
 
         [iconView, titleLabel, messageLabel,
          dividerView, errorCodeLabel,
-         retryButton, contactButton].forEach { contentView.addSubview($0) }
+         exitButton, contactButton].forEach { contentView.addSubview($0) }
 
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
@@ -234,13 +238,13 @@ public class ZTAErrorViewController: UIViewController {
             errorCodeLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 32),
             errorCodeLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -32),
 
-            // Retry button
-            retryButton.topAnchor.constraint(equalTo: errorCodeLabel.bottomAnchor, constant: 40),
-            retryButton.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            retryButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
+            // Exit button
+            exitButton.topAnchor.constraint(equalTo: errorCodeLabel.bottomAnchor, constant: 40),
+            exitButton.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            exitButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
 
             // Contact button
-            contactButton.topAnchor.constraint(equalTo: retryButton.bottomAnchor, constant: 8),
+            contactButton.topAnchor.constraint(equalTo: exitButton.bottomAnchor, constant: 8),
             contactButton.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             contactButton.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -48),
         ])
@@ -249,12 +253,9 @@ public class ZTAErrorViewController: UIViewController {
     // MARK: - Configure content berdasarkan error type
     private func configureContent() {
         guard let nsError = error as? NSError else {
-            // Nothing should reach here any more - every failure now carries an error - but if one
-            // ever does, the reader still gets a way forward instead of a screen with two buttons
-            // whose state was never decided.
-            messageLabel.text = "Terjadi kesalahan yang tidak diketahui. Silakan coba lagi."
+            // Nothing should reach here any more - every failure now carries an error.
+            messageLabel.text = "Terjadi kesalahan yang tidak diketahui."
             errorCodeLabel.isHidden = true
-            retryButton.isHidden = false
             contactButton.isHidden = true
             return
         }
@@ -284,12 +285,8 @@ public class ZTAErrorViewController: UIViewController {
         }
         errorCodeLabel.text = codeLine
 
-        // Sembunyikan retry jika tidak bisa di-retry. Only a genuinely permanent condition - a
-        // device that cannot do App Attest at all - reaches this with retry hidden; everything
-        // else leaves the reader something to press, because a screen whose only cure was killing
-        // the app from the switcher is not an error screen, it is a wall.
-        retryButton.isHidden    = !isRetryable
-        // Support stays reachable whenever the server was the one saying no, retryable or not.
+        // The exit button is always there. Support stays reachable whenever the server was the one
+        // saying no, or the condition is permanent.
         let serverRejected = nsError.domain == NXAppAttestErrorDomain
             && nsError.code == NXAppAttestError.serverRejected.rawValue
         contactButton.isHidden  = isRetryable && !serverRejected
@@ -323,11 +320,28 @@ public class ZTAErrorViewController: UIViewController {
 
     private func errorMessage(for error: NSError) -> (title: String, message: String, retryable: Bool) {
         guard error.domain == NXAppAttestErrorDomain else {
-            return (
-                "Koneksi Gagal",
-                "Tidak dapat terhubung ke server. Periksa koneksi internet Anda.",
-                true
-            )
+            // Integrity and posture findings used to fall through to "Koneksi Gagal", which sent
+            // the reader to check a network that was fine. Named by the layer that raised them.
+            switch error.domain {
+            case "io.nexilis.zta.highassurance":
+                return ("Integritas Aplikasi Gagal",
+                        "Aplikasi ini tidak sesuai dengan rilis yang disetujui. Pasang ulang dari sumber resmi.",
+                        true)
+            case "io.nexilis.zta.protected", "io.nexilis.zta.preflight":
+                return ("Pemeriksaan Keamanan Gagal",
+                        "Kondisi perangkat tidak memenuhi syarat keamanan aplikasi ini.",
+                        true)
+            case "io.nexilis.shield":
+                return ("Konfigurasi Keamanan Tidak Valid",
+                        "Aplikasi ini dibungkus dengan konfigurasi keamanan yang tidak dapat dipakai.",
+                        true)
+            default:
+                return (
+                    "Koneksi Gagal",
+                    "Tidak dapat terhubung ke server. Periksa koneksi internet Anda.",
+                    true
+                )
+            }
         }
 
         switch error.code {
@@ -350,10 +364,7 @@ public class ZTAErrorViewController: UIViewController {
                 true
             )
         case 1004:
-            // Retryable now: "Coba Lagi" revokes the registration the server rejected and registers
-            // the device afresh, which is exactly the remedy for a record the server no longer
-            // recognises - the usual state of affairs after the app has sat closed for days. The
-            // support link stays visible below for the case where it really is not recoverable.
+            // The support link stays visible below: the server is the one saying no.
             return (
                 "Server Menolak Permintaan",
                 "Server tidak dapat memverifikasi perangkat Anda. Coba lagi, atau hubungi support jika masalah berlanjut.",
@@ -406,40 +417,12 @@ public class ZTAErrorViewController: UIViewController {
 
     // MARK: - Actions
     private func setupActions() {
-        retryButton.addTarget(self, action: #selector(retryTapped), for: .touchUpInside)
+        exitButton.addTarget(self, action: #selector(exitTapped), for: .touchUpInside)
         contactButton.addTarget(self, action: #selector(contactTapped), for: .touchUpInside)
     }
 
-    @objc private func retryTapped() {
-        // The reader beat the timer to it; the screen no longer owes them an attempt. Their own
-        // press also says they are still here and still waiting, so the automatic budget is worth
-        // restoring - the limit exists to stop the app trying on its own forever, not to punish
-        // someone who is actively trying.
-        automaticRetryPending = false
-        ZTAErrorViewController.resetAutomaticRetryBudget()
-
-        // Animasi button
-        UIView.animate(withDuration: 0.1, animations: {
-            self.retryButton.transform = CGAffineTransform(scaleX: 0.95, y: 0.95)
-        }) { _ in
-            UIView.animate(withDuration: 0.1) {
-                self.retryButton.transform = .identity
-            }
-        }
-        performRetry()
-    }
-
-    private func performRetry() {
-        if let onRetry {
-            // Jika ada custom retry handler
-            onRetry()
-        } else {
-            // Default: restart attest flow via notification
-            NotificationCenter.default.post(
-                name: .ztaSessionRetry,
-                object: nil
-            )
-        }
+    @objc private func exitTapped() {
+        exitApp()
     }
 
     @objc private func contactTapped() {
@@ -453,7 +436,7 @@ public class ZTAErrorViewController: UIViewController {
     private func runEntryAnimation() {
         let views: [UIView] = [iconView, titleLabel, messageLabel,
                                 dividerView, errorCodeLabel,
-                                retryButton, contactButton]
+                                exitButton, contactButton]
         views.forEach {
             $0.alpha = 0
             $0.transform = CGAffineTransform(translationX: 0, y: 16)

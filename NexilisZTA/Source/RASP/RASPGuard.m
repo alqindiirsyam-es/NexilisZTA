@@ -20,6 +20,7 @@
 #import "SessionManager.h"
 #import "NXSecurityPolicy.h"
 #import <stdatomic.h>
+#import "SentinelOfflineGateURLProtocol.h"
 #import <os/lock.h>
 
 // Log channel khusus RASP — private agar tidak terbaca di Console.app tanpa entitlement
@@ -64,6 +65,9 @@ static os_log_t _rasp_log(void) {
 @implementation RASPGuard {
     _Atomic(uint32_t) _atomicThreatMask;
     _Atomic(bool) _atomicDeviceClean;
+    /* Barrier #1 latch. Written from the chain on the main queue, read from the URL-loading
+     * system on whichever queue it runs a request - atomic for the same reason the mask is. */
+    _Atomic(bool) _atomicOfflinePreflightPassed;
     /*
      * A.3 — one entry per pinned host, written from the TLS callback and read from whichever
      * thread is about to build a request. URLSession runs that callback on a queue of its own and
@@ -77,6 +81,9 @@ static os_log_t _rasp_log(void) {
 - (uint32_t)lastThreatMask { return atomic_load(&_atomicThreatMask); }
 - (void)setLastThreatMask:(uint32_t)mask { atomic_store(&_atomicThreatMask, mask); }
 - (BOOL)deviceClean { return atomic_load(&_atomicDeviceClean) ? YES : NO; }
+- (BOOL)offlinePreflightPassed { return atomic_load(&_atomicOfflinePreflightPassed) ? YES : NO; }
+- (void)markOfflinePreflightPassed { atomic_store(&_atomicOfflinePreflightPassed, true); }
+- (void)invalidateOfflinePreflight { atomic_store(&_atomicOfflinePreflightPassed, false); }
 - (void)setDeviceClean:(BOOL)clean { atomic_store(&_atomicDeviceClean, clean ? true : false); }
 
 /// Adds a flag without losing one a concurrent writer set at the same moment.
@@ -583,9 +590,19 @@ static NSData *nx_spki_for_key(SecKeyRef key) {
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     config.timeoutIntervalForRequest = 15.0;
     config.timeoutIntervalForResource = 30.0;
+    // No cache at all, not even the ephemeral session's in-memory one: the gateway in front of
+    // the service stamps GET /zta/challenge with Cache-Control: max-age=172800, and a retry that
+    // got the cached challenge back sent a nonce the server had already consumed ("unknown
+    // challenge") on every attempt after the first. Nothing this session carries may be reused.
+    config.URLCache = nil;
+    config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     if (@available(iOS 13.0, *)) {
         config.TLSMinimumSupportedProtocolVersion = tls_protocol_version_TLSv12;
     }
+    // Barrier #1: first in line, so nothing this session carries reaches the network before the
+    // offline preflight has opened the latch.
+    config.protocolClasses = [@[[SentinelOfflineGateURLProtocol class]]
+                              arrayByAddingObjectsFromArray:config.protocolClasses ?: @[]];
     return [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
 }
 

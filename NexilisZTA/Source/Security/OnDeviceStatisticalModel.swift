@@ -69,6 +69,19 @@ public enum SentinelOnDeviceStatisticalModel {
               (model["enabled"] as? NSNumber)?.boolValue == true else {
             return Assessment(addedRisk: 0, confidence: 0, version: "disabled", reasons: [])
         }
+        // The cross-platform 16-slot form (Sentinel v3.0): one model for Android, iOS and the
+        // server. Recognised by its schema string; scored by its own evaluator.
+        if (model["feature_schema"] as? String) == SentinelDetectionFeatureSchema.version {
+            guard let shared = SentinelStatisticalRiskModel(pack: model) else {
+                return Assessment(addedRisk: 0, confidence: 0, version: modelVersion(of: model),
+                                  reasons: ["model_malformed"])
+            }
+            let vector = SentinelDetectionFeatureSchema.vector(events: liveEvents(events, now: now))
+            let added = shared.additiveRisk(features: vector)
+            let reasons = zip(SentinelDetectionFeatureSchema.names, vector).filter { $0.1 > 0 }.map { $0.0 }
+            return Assessment(addedRisk: added, confidence: added > 0 ? 100 : 0,
+                              version: modelVersion(of: model), reasons: reasons)
+        }
         // Belt and braces. The validator refuses a mismatched schema at apply time; this repeats
         // the check at evaluate time so a pack that reached the store by any other route still
         // cannot be scored against a feature space it was not built for.
@@ -113,6 +126,15 @@ public enum SentinelOnDeviceStatisticalModel {
     }
 
     // MARK: - Features
+
+    /// The events the schema is allowed to see: the same age and skew window `featureVector`
+    /// applies, so a stale or future-stamped event counts for neither form.
+    private static func liveEvents(_ events: [[String: Any]], now: Double) -> [[String: Any]] {
+        events.filter { event in
+            let observed = (event["observed_at_ms"] as? NSNumber)?.doubleValue ?? now
+            return observed <= now + maxFutureSkewMs && now - observed <= maxEventAgeMs
+        }
+    }
 
     private static func featureVector(events: [[String: Any]], now: Double) -> [String: Double] {
         var vector: [String: Double] = [:]

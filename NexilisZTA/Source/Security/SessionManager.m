@@ -9,6 +9,7 @@
 static NSString * const kSessionTokenKey = @"io.nexilis.zta.session";
 static NSString * const kSessionExpiryKey = @"io.nexilis.zta.session.expiry";
 static NSString * const kUserAuthTokenKey = @"io.nexilis.zta.userauth";
+static NSString * const kUserAuthExpiryKey = @"io.nexilis.zta.userauth.expiry";
 
 /*
  * The token and its expiry are read on every protected operation - every send, every upload,
@@ -143,6 +144,40 @@ static NSString * const kUserAuthTokenKey = @"io.nexilis.zta.userauth";
     [self keychainSet:kUserAuthTokenKey value:[jwt dataUsingEncoding:NSUTF8StringEncoding]];
 }
 
+- (void)storeUserAuthToken:(NSString *)jwt expiresAt:(NSDate *)expiry {
+    [self keychainSet:kUserAuthTokenKey value:[jwt dataUsingEncoding:NSUTF8StringEncoding]];
+    NSError *archiveError = nil;
+    NSData *expiryData = [NSKeyedArchiver archivedDataWithRootObject:expiry
+                                              requiringSecureCoding:YES
+                                                              error:&archiveError];
+    if (expiryData != nil && archiveError == nil) {
+        [self keychainSet:kUserAuthExpiryKey value:expiryData];
+    } else {
+        [self keychainDelete:kUserAuthExpiryKey];
+    }
+}
+
+- (NSString *)validUserAuthToken {
+    NSData *expiryData = [self keychainGet:kUserAuthExpiryKey];
+    NSDate *expiry = expiryData != nil
+        ? [NSKeyedUnarchiver unarchivedObjectOfClass:[NSDate class] fromData:expiryData error:nil]
+        : nil;
+    // No expiry means a legacy, expiry-less token, and those never count as a live user auth.
+    if (expiry == nil || [expiry timeIntervalSinceNow] <= 0) return nil;
+    NSData *data = [self keychainGet:kUserAuthTokenKey];
+    NSString *token = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+    return token.length > 0 ? token : nil;
+}
+
+- (BOOL)hasValidUserAuth {
+    return [self validUserAuthToken] != nil;
+}
+
+- (void)clearUserAuth {
+    [self keychainDelete:kUserAuthTokenKey];
+    [self keychainDelete:kUserAuthExpiryKey];
+}
+
 - (NSString *)userAuthToken {
     NSData *data = [self keychainGet:kUserAuthTokenKey];
     return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
@@ -152,6 +187,7 @@ static NSString * const kUserAuthTokenKey = @"io.nexilis.zta.userauth";
     [self keychainDelete:kSessionTokenKey];
     [self keychainDelete:kSessionExpiryKey];
     [self keychainDelete:kUserAuthTokenKey];
+    [self keychainDelete:kUserAuthExpiryKey];
 
     @synchronized (self) {
         _cachedToken = nil;

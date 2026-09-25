@@ -2,7 +2,8 @@
 
 @interface PrivacyShield ()
 @property (nonatomic, weak) UIWindow *window;
-@property (nonatomic, strong) UIView *privacyCoverView;
+@property (nonatomic, strong, nullable) UIWindow *coverWindow;
+@property (nonatomic, assign) BOOL observing;
 @property (nonatomic, assign, readwrite) BOOL captureActive;
 @property (nonatomic, strong, readwrite, nullable) NSDate *lastScreenshotDate;
 @end
@@ -12,69 +13,84 @@
 + (instancetype)sharedShield {
     static PrivacyShield *shield;
     static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ shield = [PrivacyShield new]; });
+    dispatch_once(&onceToken, ^{
+        shield = [PrivacyShield new];
+        shield.coverOnInactive = YES;
+        shield.coverOnCapture = YES;
+    });
     return shield;
 }
 
 - (void)installWithWindow:(UIWindow *)window {
-    self.window = window;
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appWillResign:) name:UIApplicationWillResignActiveNotification object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appDidBecomeActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(userDidTakeScreenshot:) name:UIApplicationUserDidTakeScreenshotNotification object:nil];
-    if (@available(iOS 11.0, *)) {
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(captureStateChanged:) name:UIScreenCapturedDidChangeNotification object:nil];
-        self.captureActive = UIScreen.mainScreen.isCaptured;
-        if (self.captureActive) {
-            [self showCover];
-        }
-    }
+    if (window != nil) self.window = window;
+    if (self.observing) { [self refresh]; return; }
+    self.observing = YES;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self selector:@selector(appWillResign:) name:UIApplicationWillResignActiveNotification object:nil];
+    [center addObserver:self selector:@selector(appDidBecomeActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
+    [center addObserver:self selector:@selector(userDidTakeScreenshot:) name:UIApplicationUserDidTakeScreenshotNotification object:nil];
+    [center addObserver:self selector:@selector(captureStateChanged:) name:UIScreenCapturedDidChangeNotification object:nil];
+    self.captureActive = UIScreen.mainScreen.isCaptured;
+    [self refresh];
 }
 
-- (void)appWillResign:(NSNotification *)note { [self showCover]; }
-- (void)appDidBecomeActive:(NSNotification *)note {
-    if (!self.captureActive) {
-        [self hideCover];
-    } else {
-        [self showCover];
-    }
+- (void)appWillResign:(NSNotification *)note {
+    if (self.coverOnInactive) [self showCover];
 }
+- (void)appDidBecomeActive:(NSNotification *)note { [self refresh]; }
 - (void)userDidTakeScreenshot:(NSNotification *)note { self.lastScreenshotDate = [NSDate date]; }
 - (void)captureStateChanged:(NSNotification *)note {
-    if (@available(iOS 11.0, *)) {
-        self.captureActive = UIScreen.mainScreen.isCaptured;
-        if (self.captureActive) {
-            [self showCover];
-        } else if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
-            [self hideCover];
-        }
+    self.captureActive = UIScreen.mainScreen.isCaptured;
+    [self refresh];
+}
+
+/// The cover the current state calls for, on or off.
+- (void)refresh {
+    BOOL inactive = UIApplication.sharedApplication.applicationState != UIApplicationStateActive;
+    if ((self.coverOnCapture && self.captureActive) || (self.coverOnInactive && inactive && self.coverWindow != nil)) {
+        [self showCover];
+    } else {
+        [self hideCover];
     }
 }
 
-- (void)showCover {
-    UIWindow *targetWindow = self.window;
-    if (targetWindow == nil) {
-        for (UIWindow *candidate in UIApplication.sharedApplication.windows) {
-            if (candidate.isHidden == NO) { targetWindow = candidate; break; }
-        }
+- (UIWindowScene *)scene {
+    UIWindowScene *scene = self.window.windowScene;
+    if (scene != nil) return scene;
+    for (UIScene *candidate in UIApplication.sharedApplication.connectedScenes) {
+        if ([candidate isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)candidate;
     }
-    if (targetWindow == nil) return;
-    if (self.privacyCoverView.superview == targetWindow) return;
-    [self.privacyCoverView removeFromSuperview];
-    UIView *cover = [[UIView alloc] initWithFrame:targetWindow.bounds];
-    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    if (@available(iOS 13.0, *)) { cover.backgroundColor = UIColor.systemBackgroundColor; } else { cover.backgroundColor = UIColor.whiteColor; }
-    UILabel *label = [[UILabel alloc] initWithFrame:cover.bounds];
-    label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    label.textAlignment = NSTextAlignmentCenter;
-    label.numberOfLines = 0;
-    label.text = @"Protected view hidden while inactive or captured";
-    [cover addSubview:label];
-    self.privacyCoverView = cover;
-    [targetWindow addSubview:cover];
+    return nil;
+}
+
+/// A window of its own above everything the app shows - the host, the shield's cover, policy
+/// alerts - so the app-switcher snapshot and a recording show the cover and nothing under it.
+/// Never key: it must not take input or the first responder away from the host.
+- (void)showCover {
+    if (self.coverWindow != nil) { self.coverWindow.hidden = NO; return; }
+    UIWindowScene *scene = [self scene];
+    if (scene == nil) return;
+    UIWindow *cover = [[UIWindow alloc] initWithWindowScene:scene];
+    cover.windowLevel = UIWindowLevelAlert + 10;
+    cover.backgroundColor = UIColor.blackColor;
+    UIViewController *host = [UIViewController new];
+    UIView *view = self.coverProvider ? self.coverProvider() : nil;
+    if (view == nil) {
+        view = [[UIView alloc] initWithFrame:cover.bounds];
+        view.backgroundColor = [UIColor colorWithRed:0x0B / 255.0 green:0x14 / 255.0 blue:0x20 / 255.0 alpha:1];
+    }
+    view.frame = cover.bounds;
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    host.view = view;
+    cover.rootViewController = host;
+    cover.userInteractionEnabled = NO;
+    cover.hidden = NO;
+    self.coverWindow = cover;
 }
 
 - (void)hideCover {
-    [self.privacyCoverView removeFromSuperview];
+    self.coverWindow.hidden = YES;
+    self.coverWindow = nil;
 }
 
 @end

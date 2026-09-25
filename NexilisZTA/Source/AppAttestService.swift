@@ -128,21 +128,38 @@ public class AppAttestService {
 
     // MARK: - Request key delivery
     public func requestKeyDelivery(completion: @escaping (Data?, Error?) -> Void) {
+        requestKeyDelivery(forAccess: false, completion: completion)
+    }
+
+    /// `forAccess`: a key for opening a protected asset after the chain has finished
+    /// (APISZTA.withProtectedAsset). The chain's own state machine is neither required nor moved -
+    /// what the service needs is a registered App Attest key, a fresh nonce-bound assertion and
+    /// the same posture as the chain sends; it decides on those, every time.
+    func requestKeyDelivery(forAccess: Bool, completion: @escaping (Data?, Error?) -> Void) {
         guard isSupported else {
             completion(nil, unsupportedError())
             return
         }
-        let currentState = stateGet()
-        guard currentState == NX_STATE_APPATTEST_DEVICE_REGISTRATION ||
-              currentState == NX_STATE_APPATTEST_ENDPOINT_CONFIG else {
-            completion(nil, flowStateError("pengiriman kunci/server assertion"))
-            return
+        if forAccess {
+            guard isRegistered else {
+                completion(nil, NSError(domain: "io.nexilis.zta.protectedasset", code: 10,
+                                        userInfo: [NSLocalizedDescriptionKey:
+                                            "Protected data needs a registered install - run the ZTA chain first."]))
+                return
+            }
+        } else {
+            let currentState = stateGet()
+            guard currentState == NX_STATE_APPATTEST_DEVICE_REGISTRATION ||
+                  currentState == NX_STATE_APPATTEST_ENDPOINT_CONFIG else {
+                completion(nil, flowStateError("pengiriman kunci/server assertion"))
+                return
+            }
         }
 
         let manager = AppAttestManager.shared()
 
         // Device posture dari RASP
-        let posture: [String: Any] = [
+        var posture: [String: Any] = [
             "threat_mask":  Int(RASPGuard.shared().lastThreatMask),
             "rasp_clean":   RASPGuard.shared().deviceClean as Bool,
             "os_version":   UIDevice.current.systemVersion,
@@ -151,12 +168,29 @@ public class AppAttestService {
             "audit_chain_valid": SecurityAuditChain.verifyChain()
         ]
 
+        // High Assurance evidence: the manifest against the running executable and the shipped
+        // asset. A build with no manifest sends the asset digest alone, so the service can still
+        // bind the key it delivers to the asset it knows. A mismatch is a local tamper finding:
+        // at modes 1 and 2 the chain stops here rather than asking for a key; at mode 3 it is
+        // reported and the service decides. A missing manifest at mode 1 is a misconfigured
+        // release, and stops the chain the same way.
+        switch SentinelHighAssuranceIntegrity.posture() {
+        case .success(let evidence):
+            for (key, value) in evidence { posture[key] = value }
+        case .failure(let error):
+            NXLogger.appAttest.publicError("[HighAssurance] \(error.localizedDescription)")
+            completion(nil, error)
+            return
+        }
+
         manager.requestKeyDelivery(withPosture: posture) { decryptionKey, error in
             DispatchQueue.main.async {
                 if let key = decryptionKey {
-                    NXLogger.appAttest.publicInfo("[AppAttest] ✅ Server verified assertion and delivered key (\(key.count) bytes)")
-                    stateSet(NX_STATE_APPATTEST_ASSERTION)
-                    stateSet(NX_STATE_APPATTEST_KEY_DELIVERY)
+                    NXLogger.appAttest.publicInfo("[AppAttest] ✅ Server verified assertion and delivered key (\(key.count) bytes)\(forAccess ? " - akses data terlindungi" : "")")
+                    if !forAccess {
+                        stateSet(NX_STATE_APPATTEST_ASSERTION)
+                        stateSet(NX_STATE_APPATTEST_KEY_DELIVERY)
+                    }
                     completion(key, nil)
                 } else {
                     NXLogger.appAttest.publicError("[AppAttest] ❌ Key delivery gagal: \(error?.localizedDescription ?? "unknown")")
@@ -182,7 +216,7 @@ public class AppAttestService {
     ///   Check `ProtectedAssetStore.isAvailable()` first where that is a legitimate configuration
     ///   rather than an error.
     public func requestProtectedAsset(completion: @escaping (Data?, Error?) -> Void) {
-        requestKeyDelivery { key, error in
+        requestKeyDelivery(forAccess: true) { key, error in
             guard var delivered = key else {
                 completion(nil, error)
                 return
@@ -197,7 +231,7 @@ public class AppAttestService {
     /// `body` and zeroed on the way out, so no caller ends up deciding where to keep it.
     public func withProtectedAsset(_ body: @escaping (Data) throws -> Void,
                                    failure: @escaping (Error) -> Void) {
-        requestKeyDelivery { key, error in
+        requestKeyDelivery(forAccess: true) { key, error in
             guard var delivered = key else {
                 failure(error ?? NSError(
                     domain: "io.nexilis.zta.protectedasset", code: 0,

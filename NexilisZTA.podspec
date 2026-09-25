@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name         = "NexilisZTA"
-  spec.version      = "1.3.1"
+  spec.version      = "6.0.7"
   spec.summary      = "NexilisZTA Framework"
   spec.description  = <<-DESC
   Zero Trust Architecture hardening for iOS: RASP (jailbreak, debugger, Frida, injection,

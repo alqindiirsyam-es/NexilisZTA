@@ -280,10 +280,10 @@ Sebagian besar kegagalan sifatnya sesaat: jaringan belum siap sedetik setelah ap
 
 - enam percobaan diam-diam, jeda 2, 4, 8, 16, 16 detik, sebelum pengguna melihat apa pun
 - kegagalan tanpa jaringan tidak menghabiskan jatah percobaan, rantai diparkir sampai jaringan kembali
-- app yang kembali ke depan setelah gagal mencoba lagi dengan sendirinya
-- `ZTAErrorViewController` muncul setelah jatah habis, lengkap dengan tombol **Coba Lagi**, satu percobaan otomatis lagi setelah 15 detik, dan tautan **Hubungi Support**
+- app yang kembali ke depan setelah gagal mencoba lagi dengan sendirinya, selama layar galat belum muncul
+- `ZTAErrorViewController` muncul setelah jatah habis, dengan tombol **Keluar (5)** yang menghitung mundur dan menutup aplikasi setelah 5 detik (atau saat diketuk), serta tautan **Hubungi Support**
 
-Tombol Coba Lagi memanggil `APISZTA.retry()`, yang membuang dulu registrasi lama sebelum mengulang — registrasi yang sudah rusak akan gagal dengan cara yang sama persis kalau dipakai ulang. Host bisa memanggil `APISZTA.retry()` sendiri dari mana saja.
+Layar galat adalah akhir: tidak ada percobaan ulang dari layar itu, baik lewat tombol maupun otomatis, dan rantai tidak dimulai lagi saat app kembali ke depan atau jaringan kembali. Parameter `onRetry` pada `ZTAErrorViewController(error:onRetry:)` tetap ada agar kode lama tetap terkompilasi, tetapi diabaikan. Host yang memakai layar sendiri (`showsErrorScreen = false`) tetap bisa memanggil `APISZTA.retry()`, yang membuang dulu registrasi lama sebelum mengulang.
 
 Kalau host mau mengamati tanpa closure, tersedia tiga notifikasi dengan nama yang sama seperti sebelumnya: `.ztaSessionReady`, `.ztaSessionError` yang membawa `userInfo["error"]`, dan `.ztaSessionRetry` yang meminta rantai diulang.
 

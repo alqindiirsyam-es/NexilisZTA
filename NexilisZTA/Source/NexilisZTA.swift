@@ -25,7 +25,78 @@ import Foundation
 /// the code lives inside OneApp and impossible once a second host exists. They are settings now,
 /// and every one of them still falls back to what OneApp was already using - a host that says
 /// nothing keeps the behaviour it had.
+/// `keyId` is the App Attest key id the assertion must carry as `binding_id`; `completion` takes
+/// the signed assertion, or the reason there is none.
+public typealias BootstrapAuthenticationProvider = (_ keyId: String, _ completion: @escaping (Result<String, Error>) -> Void) -> Void
+
 public struct NexilisZTAConfiguration {
+
+    /// Institution user authentication before key delivery (Sentinel v3.0.1 bootstrap).
+    ///
+    /// The host's way of producing an IdP assertion - a JWT the institution's identity provider
+    /// signed for this user, with `typ=sentinel-idp-auth`, `sub`, `platform=ios`,
+    /// `binding_id=<App Attest key id>`, `jti`, `iat`, `exp` - after the device has attested and
+    /// before the key is delivered. The layer posts it to `/zta/bootstrap/auth`, keeps the
+    /// short-lived user credential the service returns, and only then asks for the key. The
+    /// closure receives the App Attest key id to put in `binding_id`.
+    ///
+    /// Nil (the default) keeps the chain as it was: attest, then key. Set
+    /// `userAuthenticationRequired` to refuse to run without a provider.
+    public var bootstrapAuthentication: BootstrapAuthenticationProvider? = nil
+
+    /// Refuse the chain at modes 1 and 2 when no `bootstrapAuthentication` provider is set, rather
+    /// than silently delivering a key to an unauthenticated user. Off by default: a host that has
+    /// no institution IdP is a legitimate configuration until it declares otherwise.
+    public var userAuthenticationRequired = false
+
+    /// The user credential from `bootstrapAuthentication` counts for this launch only: a live one
+    /// left in the Keychain by an earlier launch does not skip the provider. For a provider whose
+    /// sign-in result the host applies in-process (NexilisLite's pre-asset form), reusing it would
+    /// open the session with nothing to apply - and the host falls back to its old sign-in screens.
+    /// Within one launch a retry of the chain still reuses it. Off by default.
+    public var userAuthenticationPerLaunch = false
+
+    /// Explicit RIL pilot opt-in. Configure before starting ZTA; nil keeps legacy behavior.
+    /// App identity/environment and enrollment URL must match the backend deployment.
+    ///
+    /// Most hosts leave this nil and declare the opt-in in Info.plist instead - see
+    /// `rilInfoPlistKey`. A value set here wins over the plist.
+    public var ril: RILConfiguration? = nil
+
+    /// Where `APISZTA.configure` looks for the RIL opt-in when `ril` is nil: an Info.plist
+    /// dictionary under this key, read by `RILConfiguration.fromInfoPlist`. No dictionary means
+    /// no RIL; a broken one stops configure() with `RILError.invalidConfiguration` rather than
+    /// starting the app without it. Nil turns the lookup off altogether.
+    public var rilInfoPlistKey: String? = RILConfiguration.defaultInfoPlistKey
+
+    /// Which HTTPS requests beyond the ZTA pilot routes leave RIL-signed - NexilisLite's backend,
+    /// the host's own API - for a backend that checks them through /zta/ril/verify. Needs `ril`
+    /// (or the plist opt-in). Nil here falls back to the protection keys of the same plist
+    /// dictionary (`ProtectedURLs`, `ProtectionMode`, ...); none there either, nothing beyond the
+    /// pilot routes is signed. See RILProtection.
+    public var rilProtection: RILProtection? = nil
+
+    /// The RIL opt-in as a dictionary instead of an Info.plist key - how the no-code shield passes
+    /// its NexilisShield.plist `RIL` entry. Same keys as the Info.plist `NexilisRIL` dictionary;
+    /// wins over `rilInfoPlistKey`, loses to `ril`.
+    public var rilSettings: [String: Any]? = nil
+
+    /// Whether the layer puts up the RIL recovery alerts itself - configuration rejected,
+    /// enrollment failed, telemetry suspended - on whatever the host is showing. A host with
+    /// its own recovery UI turns this off and drives `APISZTA.rilSession`,
+    /// `retryRILEnrollment()` and `isRILTelemetrySuspended` itself.
+    public var showsRILRecoveryUI = true
+
+    /// What the app shows while it is inactive, recorded or captured - the Sentinel privacy screen.
+    /// All on by default. `.off` for a host that has a privacy screen of its own or wants none;
+    /// each of the three can be switched on its own (see SentinelPrivacy).
+    public var privacyShield = PrivacyShieldOptions.all
+
+    /// Modes 1 and 2: the host's interface stays behind the "Sentinel Security Checking..." screen until
+    /// the chain has authorized the device (SentinelSecurityCover) - the pre-asset sign-in form appears
+    /// over it, a failure keeps it with the ZTA error screen on top. On by default; off for a host whose
+    /// own splash already covers that time. Mode 3 never shows it. The no-code shield has its own.
+    public var showsSecurityCheckingCover = true
 
     /// Base of the ZTA service. The endpoints below are derived from it unless given.
     public var baseURL: String
@@ -39,6 +110,8 @@ public struct NexilisZTAConfiguration {
     /// `KillSwitchManager.checkServerStatusAndApply`: it is how a signed pin rotation and a
     /// revoked install reach a device that is already running. Modes 1 and 2 only.
     public var statusVerifyEndpoint: String
+    /// Where the IdP assertion goes for a user credential. Derived from `baseURL`.
+    public var bootstrapAuthEndpoint: String
 
     /// Sentinel v2 endpoints. All three are reached only with a live ZTA session, so none of them
     /// is ever the first thing this app says to the network - attestation is. Modes 1 and 2 only;
@@ -131,6 +204,7 @@ public struct NexilisZTAConfiguration {
         self.keyDeliveryEndpoint = NXEncryptedKeyEndpoint()
         self.revokeEndpoint = NXEncryptedRevokeEndpoint()
         self.statusVerifyEndpoint = NXEncryptedAPIBaseURL() + "zta/status/verify"
+        self.bootstrapAuthEndpoint = NXEncryptedAPIBaseURL() + "zta/bootstrap/auth"
         self.securityPackEndpoint = NXEncryptedAPIBaseURL() + "zta/security-pack"
         self.telemetryEndpoint = NXEncryptedAPIBaseURL() + "zta/telemetry/events"
         self.sensitiveDecisionEndpoint = NXEncryptedAPIBaseURL() + "zta/sensitive/decision"
@@ -206,6 +280,7 @@ public struct NexilisZTAConfiguration {
         self.keyDeliveryEndpoint = root + "/zta/key"
         self.revokeEndpoint = root + "/zta/revoke"
         self.statusVerifyEndpoint = root + "/zta/status/verify"
+        self.bootstrapAuthEndpoint = root + "/zta/bootstrap/auth"
         self.securityPackEndpoint = root + "/zta/security-pack"
         self.telemetryEndpoint = root + "/zta/telemetry/events"
         self.sensitiveDecisionEndpoint = root + "/zta/sensitive/decision"

@@ -20,10 +20,12 @@ let package = Package(
                 "RASP/RASPBridge.m",
                 "RASP/RASPGuard.m",
                 "Security/EnvironmentReport.m",
+                "Network/SentinelOfflineGateURLProtocol.m",
                 "Security/NetworkPosture.m",
                 "Security/NXSecurityPolicy.m",
                 "Security/PrivacyShield.m",
-                "Security/SessionManager.m"
+                "Security/SessionManager.m",
+                "Shield/NXShieldBootstrap.m"
             ],
             publicHeadersPath: ".",
             // CocoaPods flattens every public header into one directory, so the
@@ -34,8 +36,10 @@ let package = Package(
                 .headerSearchPath("."),
                 .headerSearchPath("Attestation"),
                 .headerSearchPath("Encryption"),
+                .headerSearchPath("Network"),
                 .headerSearchPath("RASP"),
-                .headerSearchPath("Security")
+                .headerSearchPath("Security"),
+                .headerSearchPath("Shield")
             ]
         ),
         .target(
@@ -44,6 +48,7 @@ let package = Package(
             path: "NexilisZTA/Source",
             sources: [
                 "APISZTA.swift",
+                "RIL",
                 "AppAttestService.swift",
                 "Input/SecureInputHardening.swift",
                 "Input/SecureNumericKeypad.swift",
@@ -51,14 +56,25 @@ let package = Package(
                 "Network/SecureWebViewFactory.swift",
                 "NexilisZTA.swift",
                 "NXLogger.swift",
+                "Security/DetectionFeatureSchema.swift",
                 "Security/DuressAndGeofence.swift",
+                "Security/HighAssuranceIntegrity.swift",
+                "Security/InstallToken.swift",
+                "Security/OfflinePreflight.swift",
                 "Security/OnDeviceStatisticalModel.swift",
                 "Security/SecurityPackPolicyValidator.swift",
                 "Security/ProtectedAssetStore.swift",
+                "Security/ProtectedData.swift",
+                "Security/ProtectedRuntimeVerifier.swift",
                 "Security/SecuritySupport.swift",
+                "Security/SentinelPrivacy.swift",
+                "Security/SentinelVaultClient.swift",
                 "Security/TelemetryLoop.swift",
                 "Security/ThreatIntelMatcher.swift",
+                "Shield/ShieldAutostart.swift",
                 "Support/ZTAReachability.swift",
+                "UI/SentinelBrandView.swift",
+                "UI/SentinelSecurityCover.swift",
                 "UI/ZTAErrorViewController.swift"
             ]
         )

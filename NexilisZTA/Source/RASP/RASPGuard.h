@@ -42,6 +42,14 @@ NS_ASSUME_NONNULL_BEGIN
 - (uint32_t)runChecksNow;
 - (NSURLSession *)pinnedURLSession;
 
+/* Barrier #1 - process-local network latch. Closed at launch and at the start of every
+ * verification attempt; opened only by SentinelOfflinePreflight once every locally observable
+ * check has passed. SentinelOfflineGateURLProtocol fails SDK requests while it is closed, and
+ * AppAttestManager reports its state to the service with every attest/key request. */
+@property (nonatomic, readonly) BOOL offlinePreflightPassed;
+- (void)markOfflinePreflightPassed;
+- (void)invalidateOfflinePreflight;
+
 /* A.2 — reusable pinning API for PinnedURLSessionDelegate */
 - (BOOL)isPinnedHost:(NSString *)host;
 - (BOOL)serverTrust:(SecTrustRef)trust matchesPinnedSPKIForHost:(NSString *)host;
