@@ -92,11 +92,19 @@ public struct NexilisZTAConfiguration {
     /// each of the three can be switched on its own (see SentinelPrivacy).
     public var privacyShield = PrivacyShieldOptions.all
 
-    /// Modes 1 and 2: the host's interface stays behind the "Sentinel Security Checking..." screen until
-    /// the chain has authorized the device (SentinelSecurityCover) - the pre-asset sign-in form appears
-    /// over it, a failure keeps it with the ZTA error screen on top. On by default; off for a host whose
-    /// own splash already covers that time. Mode 3 never shows it. The no-code shield has its own.
+    /// The host's interface stays behind the "Sentinel Security Checking..." screen until the chain
+    /// has authorized the device (SentinelSecurityCover) - at every mode that runs the chain, mode 3
+    /// included. The pre-asset sign-in form (modes 1 and 2) appears over it, a failure keeps it with the
+    /// ZTA error screen on top. On by default; off for a host whose own splash already covers that time.
+    /// A mode 3 app that skips the chain shows none. The no-code shield has its own.
     public var showsSecurityCheckingCover = true
+
+    /// How that cover is drawn. `.fullScreen`, the default, is the Sentinel screen itself.
+    /// `.overLaunchScreen` is for a host with a splash of its own: its launch screen is left as it
+    /// is, and only a small "Sentinel Security Checking..." pill sits over it while the chain runs -
+    /// so the reader sees the host's splash from launch to the host's first screen, with nothing
+    /// swapped in between. A host without a launch storyboard gets `.fullScreen`.
+    public var securityCheckingCoverStyle = SentinelCoverStyle.fullScreen
 
     /// Base of the ZTA service. The endpoints below are derived from it unless given.
     public var baseURL: String
@@ -303,4 +311,13 @@ public struct NexilisZTAConfiguration {
         if let expectedTeamID { self.expectedTeamID = expectedTeamID }
         if let expectedAppAttestEnvironment { self.expectedAppAttestEnvironment = expectedAppAttestEnvironment }
     }
+}
+
+/// How the "Sentinel Security Checking..." cover is drawn - see
+/// `NexilisZTAConfiguration.securityCheckingCoverStyle`.
+public enum SentinelCoverStyle {
+    /// The Sentinel screen, over everything.
+    case fullScreen
+    /// The host's own launch screen, with a small Sentinel pill over it.
+    case overLaunchScreen
 }

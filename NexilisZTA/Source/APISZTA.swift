@@ -210,9 +210,18 @@ public enum APISZTA {
                                  onFailure: ((Error) -> Void)? = nil,
                                  onReady: @escaping () -> Void) {
         onMain {
+            // Up at once, before anything else is set going. Fix: this waited for the task below,
+            // which runs on a later turn of the main loop - by when the host had put its own
+            // first screen up and the system had drawn it, so the host's splash was seen before
+            // the cover that was meant to hide it.
+            if configuration.showsSecurityCheckingCover {
+                MainActor.assumeIsolated { SentinelSecurityCover.show(style: configuration.securityCheckingCoverStyle) }
+            }
             Task { @MainActor in
                 do { try installRILLifecycle(for: configuration) }
                 catch {
+                    // Nothing is being checked after all: the host is not kept covered.
+                    SentinelSecurityCover.hide()
                     self.onFailure = onFailure
                     self.showsErrorScreen = showsErrorScreen
                     self.onReady = nil
@@ -230,8 +239,11 @@ public enum APISZTA {
                 }
                 self.rilConfigurationRejected = false
                 if configuration.showsRILRecoveryUI, rilSession != nil { RILRecoveryPresenter.shared.install() }
-                // Modes 1 and 2: nothing of the host is shown before the device is authorized.
-                if configuration.showsSecurityCheckingCover, configuration.appMode != .regular {
+                // Nothing of the host is shown before the device is authorized - at mode 3 as
+                // well, whenever it runs the chain. Fix: mode 3 was left out, so an app running
+                // the chain at that mode showed its own screens while the check was still going.
+                // A mode 3 app that skips the chain never comes through here and shows no cover.
+                if configuration.showsSecurityCheckingCover {
                     SentinelSecurityCover.show()
                 }
                 applyConfiguration(configuration, armAppAttest: false)
