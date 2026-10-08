@@ -100,10 +100,10 @@ public enum SentinelOfflinePreflight {
                    "Screen capture, recording, mirroring or a secondary display is active.")
 
         let proxy = proxyIsConfigured()
-        try refuse(proxy, enforce, -7413, "A local proxy/PAC/SOCKS configuration is active.")
+        try refuse(proxy, enforce, proxyFindingCode, proxyFindingMessage)
 
         let (vpn, trusted) = vpnInterfaceState()
-        try refuse(vpn && !trusted, enforce, -7414, "A VPN/tunnel interface is active.")
+        try refuse(vpn && !trusted, enforce, vpnFindingCode, vpnFindingMessage)
 
         let appAttest = AppAttestService.shared.isSupported
         try refuse(!appAttest, enforce, -7415, "App Attest/Secure Enclave capability is unavailable.")
@@ -138,6 +138,23 @@ public enum SentinelOfflinePreflight {
             throw failure(Int(NXOfflineGateErrorCode),
                           "Sentinel networking is locked until the offline security preflight passes.")
         }
+    }
+
+    // MARK: - Network finding (shared with the mid-session guard)
+
+    static let proxyFindingCode = -7413
+    static let proxyFindingMessage = "A local proxy/PAC/SOCKS configuration is active."
+    static let vpnFindingCode = -7414
+    static let vpnFindingMessage = "A VPN/tunnel interface is active."
+
+    /// The proxy / VPN part of this gate on its own: the same probes, codes and messages, so a
+    /// proxy or VPN switched on after launch is refused exactly as one present at launch
+    /// (`SentinelMidSessionNetworkGuard`). Nil when the network is clean.
+    static func networkFinding() -> NSError? {
+        if proxyIsConfigured() { return failure(proxyFindingCode, proxyFindingMessage) }
+        let (vpn, trusted) = vpnInterfaceState()
+        if vpn && !trusted { return failure(vpnFindingCode, vpnFindingMessage) }
+        return nil
     }
 
     // MARK: - Probes

@@ -30,6 +30,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// Compiled-in pins for first-party hosts that are not the ZTA host. Kept apart from the rotation
 /// pins above, which a signed payload replaces wholesale.
 - (void)configureHostPinFloor:(NSDictionary<NSString *, NSArray<NSString *> *> *)pinsByHost;
+/// The host app's own backends (NexilisZTAConfiguration.pinnedHosts / Info.plist NSPinnedDomains):
+/// host (lowercase) -> @{@"subdomains": @(BOOL), @"pins": @[@"sha256/<base64 SPKI>", ...]}. A
+/// connection to one of them is accepted only when a certificate anywhere in its chain (the leaf or an
+/// issuing CA) matches one of its pins; an entry with no pins refuses every connection (fail closed).
+/// The first-party ZTA domains keep their own pins and cannot be overridden here.
+- (void)configurePinnedHosts:(NSDictionary<NSString *, NSDictionary *> *)hosts;
 - (void)configureExpectedBundleID:(NSString *)bundleID
                      applicationID:(NSString *)applicationID
                             teamID:(NSString *)teamID
@@ -54,6 +60,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)isPinnedHost:(NSString *)host;
 - (BOOL)serverTrust:(SecTrustRef)trust matchesPinnedSPKIForHost:(NSString *)host;
 - (void)reportPinningFailureForHost:(NSString *)host;
+/// The response to a pin mismatch: a first-party host goes through reportPinningFailureForHost: (a
+/// compromised channel), a host-app backend is only logged - its connection is refused by the caller.
+- (void)reportPinMismatchForHost:(NSString *)host;
 
 /*
  * A.3 — channel binding: the pinned leaf this process actually reached a given host over.
@@ -74,6 +83,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, assign) NSTimeInterval monitoringInterval;
 @property (nonatomic, weak, nullable) id<RASPGuardDelegate> delegate;
+/// Called synchronously, on the detecting queue, right BEFORE a runtime threat revokes the local
+/// session at app modes 1 and 2 - the last moment a live session token still exists to report it with.
+/// Without it the server never learns that this install was compromised: the token is gone by the
+/// time anything observes `io.nexilis.zta.runtimeCompromise`. NexilisZTA installs it; keep it short.
+@property (nonatomic, copy, nullable) void (^runtimeThreatReporter)(uint32_t threats);
 @property (nonatomic, readonly) uint32_t lastThreatMask;
 @property (nonatomic, readonly) BOOL deviceClean;
 @property (nonatomic, readonly) BOOL pinningConfigured;

@@ -54,6 +54,13 @@ static NSString *NXBase64(NSData *data) {
     return [data base64EncodedStringWithOptions:0];
 }
 
+static NSString *NXHex(NSData *data) {
+    NSMutableString *out = [NSMutableString stringWithCapacity:data.length * 2];
+    const unsigned char *bytes = data.bytes;
+    for (NSUInteger i = 0; i < data.length; i++) [out appendFormat:@"%02x", bytes[i]];
+    return out;
+}
+
 static NSData *NXDataFromBase64(id value) {
     if (![value isKindOfClass:[NSString class]]) return nil;
     return [[NSData alloc] initWithBase64EncodedString:(NSString *)value options:0];
@@ -861,6 +868,14 @@ static NSString *NXChannelBindingForEndpoint(NSString *endpoint) {
                 return;
             }
             if (channelBinding.length > 0) body[@"tls_spki"] = channelBinding;
+            // The user credential travels as the X-Sentinel-User-Auth header, outside what the
+            // assertion signs. Its hash inside the signed body binds this request to that credential:
+            // a header swapped for another user's live credential no longer matches what the Secure
+            // Enclave signed (the Android ZTA binds user_auth_sha256 into its /key proof the same way).
+            NSString *userAuth = [[SessionManager sharedManager] validUserAuthToken];
+            if (userAuth.length > 0) {
+                body[@"user_auth_sha256"] = NXHex(NXSHA256([userAuth dataUsingEncoding:NSUTF8StringEncoding]));
+            }
 
             NSError *canonicalError = nil;
             NSData *canonical = NXCanonicalJSONData(body, &canonicalError);

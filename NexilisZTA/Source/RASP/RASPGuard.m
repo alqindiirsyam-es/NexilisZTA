@@ -25,6 +25,8 @@
 
 // Log channel khusus RASP — private agar tidak terbaca di Console.app tanpa entitlement
 static NSData *nx_spki_for_key(SecKeyRef key);
+static BOOL nx_is_first_party_host(NSString *host);
+static NSString *nx_chain_pin_matching(SecTrustRef trust, NSArray *pins);
 
 static os_log_t _rasp_log(void) {
     static os_log_t log = NULL;
@@ -47,6 +49,7 @@ static os_log_t _rasp_log(void) {
 @property (nonatomic, copy, nullable) NSString *backupPin;
 @property (nonatomic, copy) NSDictionary<NSString *, NSArray<NSString *> *> *additionalPinsByHost;
 @property (nonatomic, copy) NSDictionary<NSString *, NSArray<NSString *> *> *hostPinFloor;
+@property (nonatomic, copy) NSDictionary<NSString *, NSDictionary *> *appPinnedHosts;
 @property (nonatomic, copy, nullable) NSString *expectedBundleID;
 @property (nonatomic, copy, nullable) NSString *expectedApplicationID;
 @property (nonatomic, copy, nullable) NSString *expectedTeamID;
@@ -271,6 +274,10 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
             // stops protected operations. At .regular the delegate below is still told, and the
             // server still decides - the session is not torn down from here.
             if ([NXSecurityPolicy revokesOnRuntimeThreat]) {
+                // Report first, with the session that is about to be cleared, so the service can
+                // revoke this install as well - not only this process.
+                void (^reporter)(uint32_t) = strongSelf.runtimeThreatReporter;
+                if (reporter) reporter(threats);
                 [[SessionManager sharedManager] clearAll];
                 [[NSNotificationCenter defaultCenter] postNotificationName:@"io.nexilis.zta.runtimeCompromise"
                                                                     object:nil
@@ -401,6 +408,30 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     self.hostPinFloor = [lowercased copy];
 }
 
+- (void)configurePinnedHosts:(NSDictionary<NSString *, NSDictionary *> *)hosts {
+    NSMutableDictionary *lowercased = [NSMutableDictionary dictionaryWithCapacity:hosts.count];
+    [hosts enumerateKeysAndObjectsUsingBlock:^(NSString *host, NSDictionary *entry, BOOL *stop) {
+        NSString *key = host.lowercaseString;
+        if (key.length == 0 || nx_is_first_party_host(key)) return;
+        NSArray *pins = [entry[@"pins"] isKindOfClass:[NSArray class]] ? entry[@"pins"] : @[];
+        lowercased[key] = @{@"subdomains": @([entry[@"subdomains"] boolValue]), @"pins": [pins copy]};
+    }];
+    self.appPinnedHosts = [lowercased copy];
+}
+
+/// The configured entry that covers this host: the host itself, or a parent that includes subdomains.
+- (nullable NSDictionary *)appPinnedHostEntryFor:(NSString *)host {
+    NSString *key = host.lowercaseString;
+    if (key.length == 0) return nil;
+    NSDictionary *exact = self.appPinnedHosts[key];
+    if (exact) return exact;
+    for (NSString *candidate in self.appPinnedHosts) {
+        NSDictionary *entry = self.appPinnedHosts[candidate];
+        if ([entry[@"subdomains"] boolValue] && [key hasSuffix:[@"." stringByAppendingString:candidate]]) return entry;
+    }
+    return nil;
+}
+
 - (void)configureAdditionalPins:(NSArray<NSString *> *)pins forHost:(NSString *)host {
     if (host.length == 0) return;
     NSMutableDictionary *next = [self.additionalPinsByHost mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -411,18 +442,25 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
 // A.2 — reusable pinning API (used by PinnedURLSessionDelegate)
 - (BOOL)isPinnedHost:(NSString *)host {
     if (!host.length) return NO;
-    // Pin semua host ZTA dan banking domain
-    NSArray *pinnedSuffixes = @[@"newuniverse.io", @"nexilis.io"];
-    for (NSString *suffix in pinnedSuffixes) {
-        if ([host isEqualToString:suffix] || [host hasSuffix:[@"." stringByAppendingString:suffix]]) {
-            return YES;
-        }
-    }
-    return NO;
+    // Pin semua host ZTA dan banking domain, lalu backend milik app host yang dikonfigurasi.
+    if (nx_is_first_party_host(host.lowercaseString)) return YES;
+    return [self appPinnedHostEntryFor:host] != nil;
 }
 
 - (BOOL)serverTrust:(SecTrustRef)trust matchesPinnedSPKIForHost:(NSString *)host {
     if (trust == NULL) return NO;
+    // A host app backend: any certificate of the chain (leaf or issuing CA) against that host's pins.
+    if (!nx_is_first_party_host(host.lowercaseString)) {
+        NSDictionary *entry = [self appPinnedHostEntryFor:host];
+        if (entry == nil) return NO;
+        NSString *matchedPin = nx_chain_pin_matching(trust, entry[@"pins"]);
+        if (matchedPin == nil) return NO;
+        NSString *key = host.lowercaseString;
+        os_unfair_lock_lock(&_channelBindingLock);
+        _pinnedLeafSPKIByHost[key] = matchedPin;
+        os_unfair_lock_unlock(&_channelBindingLock);
+        return YES;
+    }
     SecKeyRef serverKey = SecTrustCopyKey(trust);
     if (serverKey == NULL) return NO;
     NSData *spki = nx_spki_for_key(serverKey);
@@ -479,6 +517,18 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     return host.length > 0 ? [self pinnedLeafSPKIForHost:host] : nil;
 }
 
+- (void)reportPinMismatchForHost:(NSString *)host {
+    // A first-party (ZTA) pin mismatch is a compromised channel and, at modes 1 and 2, revokes the
+    // session. The host app's own backend is refused - the connection is cancelled - and nothing else:
+    // the same as the Android ZTA's pinnedHosts, where a mismatch fails the connection only.
+    if (nx_is_first_party_host(host.lowercaseString)) {
+        [self reportPinningFailureForHost:host];
+    } else {
+        os_log_with_type(_rasp_log(), OS_LOG_TYPE_ERROR,
+                         "Certificate pinning refused a connection to an app-pinned host: %{private}@", host);
+    }
+}
+
 - (void)reportPinningFailureForHost:(NSString *)host {
     os_log_with_type(_rasp_log(), OS_LOG_TYPE_ERROR,
                      "Certificate pinning failure for host: %{private}@", host);
@@ -487,6 +537,8 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
     // and revoke, .regular reports it and leaves the session alone.
     if ([NXSecurityPolicy revokesOnRuntimeThreat]) {
         [self raiseThreatFlag:RASP_THREAT_TAMPERED];
+        void (^reporter)(uint32_t) = self.runtimeThreatReporter;
+        if (reporter) reporter(RASP_THREAT_TAMPERED);
         [[SessionManager sharedManager] clearAll];
         [[NSNotificationCenter defaultCenter] postNotificationName:@"io.nexilis.zta.runtimeCompromise"
                                                             object:nil
@@ -502,6 +554,47 @@ static NSString *nx_sha256_hex_for_data(NSData *data) {
             [self.delegate raspGuard:self didDetectThreats:RASP_THREAT_TAMPERED];
         });
     }
+}
+
+/// The first-party domains whose pins are compiled in (the ZTA service and the operator domain).
+static BOOL nx_is_first_party_host(NSString *host) {
+    if (host.length == 0) return NO;
+    for (NSString *suffix in @[@"newuniverse.io", @"nexilis.io"]) {
+        if ([host isEqualToString:suffix] || [host hasSuffix:[@"." stringByAppendingString:suffix]]) return YES;
+    }
+    return NO;
+}
+
+/// "sha256/<base64>" of the SPKI of the first certificate in the chain whose pin is in `pins`, or nil.
+static NSString *nx_chain_pin_matching(SecTrustRef trust, NSArray *pins) {
+    if (trust == NULL || ![pins isKindOfClass:[NSArray class]] || pins.count == 0) return nil;
+    NSMutableArray *certificates = [NSMutableArray array];
+    if (@available(iOS 15.0, *)) {
+        NSArray *chain = CFBridgingRelease(SecTrustCopyCertificateChain(trust));
+        if (chain) [certificates addObjectsFromArray:chain];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CFIndex count = SecTrustGetCertificateCount(trust);
+        for (CFIndex i = 0; i < count; i++) {
+            SecCertificateRef cert = SecTrustGetCertificateAtIndex(trust, i);
+            if (cert) [certificates addObject:(__bridge id)cert];
+        }
+#pragma clang diagnostic pop
+    }
+    for (id object in certificates) {
+        SecKeyRef key = SecCertificateCopyKey((__bridge SecCertificateRef)object);
+        if (key == NULL) continue;
+        NSData *spki = nx_spki_for_key(key);
+        CFRelease(key);
+        if (spki == nil) continue;
+        unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(spki.bytes, (CC_LONG)spki.length, hash);
+        NSString *pin = [@"sha256/" stringByAppendingString:
+                         [[NSData dataWithBytes:hash length:CC_SHA256_DIGEST_LENGTH] base64EncodedStringWithOptions:0]];
+        if ([pins containsObject:pin]) return pin;
+    }
+    return nil;
 }
 
 static NSData *nx_spki_for_key(SecKeyRef key) {
@@ -650,7 +743,7 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
     // the immutable floor; PinSetStore feeds only signature-verified additive pins into
     // additionalPinsByHost. No build mode may silently downgrade this to system trust.
     if (![self serverTrust:serverTrust matchesPinnedSPKIForHost:host]) {
-        [self reportPinningFailureForHost:host];
+        [self reportPinMismatchForHost:host];
         completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
         return;
     }

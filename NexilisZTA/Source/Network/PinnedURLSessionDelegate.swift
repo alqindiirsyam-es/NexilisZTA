@@ -63,7 +63,7 @@ public final class PinnedURLSessionDelegate: NSObject, URLSessionTaskDelegate, U
                 || PinSetStore.matches(trust: trust, host: host) {
                 completionHandler(.useCredential, URLCredential(trust: trust))
             } else {
-                RASPGuard.shared().reportPinningFailure(forHost: host)
+                RASPGuard.shared().reportPinMismatch(forHost: host)
                 completionHandler(.cancelAuthenticationChallenge, nil)
             }
             return

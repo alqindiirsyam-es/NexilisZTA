@@ -56,6 +56,19 @@ public struct NexilisZTAConfiguration {
     /// Within one launch a retry of the chain still reuses it. Off by default.
     public var userAuthenticationPerLaunch = false
 
+    /// A proxy or an untrusted VPN switched on after the session opened is refused like one present
+    /// at launch (Barrier #1, codes -7413 / -7414): the authorization is revoked and the failure
+    /// screen closes the app. Modes 1 and 2 only, the same modes the boot gate enforces at; nothing is
+    /// persisted, the next launch goes through the boot gate again. On by default (the Android ZTA's
+    /// `midsession_network_block`); NexilisShield.plist `MidSessionNetworkBlock = false` turns it off.
+    public var midSessionNetworkBlock = true
+
+    /// The host app's own backends, pinned (SentinelPinnedHosts.swift). Defaults to Info.plist
+    /// `NSAppTransportSecurity > NSPinnedDomains`, which iOS itself enforces for the app's URLSession
+    /// and WKWebView traffic; the SDK enforces the same entries in PinnedURLSessionDelegate. Each host
+    /// needs two different pins.
+    public var pinnedHosts: [SentinelPinnedHost] = SentinelPinnedHost.fromInfoPlist()
+
     /// Explicit RIL pilot opt-in. Configure before starting ZTA; nil keeps legacy behavior.
     /// App identity/environment and enrollment URL must match the backend deployment.
     ///

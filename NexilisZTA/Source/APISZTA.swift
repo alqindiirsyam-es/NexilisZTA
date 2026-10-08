@@ -280,6 +280,7 @@ public enum APISZTA {
         RASPGuard.shared().configurePinning(withPrimaryPin: configuration.primaryPin,
                                             backupPin: configuration.backupPin)
         RASPGuard.shared().configureHostPinFloor(configuration.pinnedHostPins)
+        RASPGuard.shared().configurePinnedHosts(SentinelPinnedHost.guardConfiguration(configuration.pinnedHosts))
         AppAttestManager.shared().minimumOSMajor = configuration.minimumAppAttestOSMajor
         // Every embedded path passes here - configure, the steps driven by hand, SecurityShield
         // on its own - so each gets the privacy covers the configuration asks for.
@@ -352,6 +353,7 @@ public enum APISZTA {
     public static func revokeLocalAuthorization(reason: String = "local security revocation") {
         // First, so nothing wakes up mid-teardown holding a token that is about to stop existing.
         SentinelTelemetryLoop.stop()
+        SentinelMidSessionNetworkGuard.stop()
         Task { @MainActor in rilSession?.suspend() }
         // A revoked authorization takes its activation proof with it.
         SentinelProtectedRuntimeVerifier.invalidate()
@@ -713,6 +715,69 @@ public enum APISZTA {
         }
     }
 
+    /// The last report of a runtime threat, sent with the session the threat is about to revoke.
+    ///
+    /// The periodic RASP check revokes the local authorization at app modes 1 and 2 the moment it
+    /// finds something, and the regular loop above needs a live token - so without this the service
+    /// never heard of the compromise and kept the install registered: the same device could simply
+    /// start a new chain. This send skips the loop's buffer and backoff (it is the only chance), and
+    /// the evidence is what `currentEvents` reports plus the threat that triggered it, so the
+    /// service's continuous-risk scoring can revoke the install (`runtime_instrumentation` at
+    /// severity 95 is a hard block). Best effort: a channel that already failed pinning may not
+    /// carry it, and nothing here waits for the answer.
+    static func reportRuntimeThreatBeforeRevocation(mask: UInt32) {
+        let now = Date().timeIntervalSince1970 * 1000
+        var events = SentinelThreatTelemetry.currentEvents()
+        if !events.contains(where: { ($0["category"] as? String) == "runtime_instrumentation" }) {
+            events.insert(SentinelThreatTelemetry.event(sensor: "rasp", category: "runtime_instrumentation",
+                                                        severity: 95, confidence: 95, now: now,
+                                                        attributes: ["threat_code": String(mask)]), at: 0)
+        }
+        reportEvidenceBeforeRevocation(events: events, auditEvent: "zta_runtime_threat_reported",
+                                       detail: ["threat_mask": mask])
+    }
+
+    /// One send to the collector under the session that is about to be revoked, outside the loop's
+    /// buffer and backoff. Best effort: nothing waits for the answer.
+    static func reportEvidenceBeforeRevocation(events: [[String: Any]], auditEvent: String, detail: [String: Any]) {
+        guard let token = SessionManager.shared().validSessionToken(), !token.isEmpty,
+              let url = URL(string: configuration.telemetryEndpoint), !events.isEmpty else { return }
+        let body: [String: Any] = ["events": Array(events.prefix(20)),
+                                   "audit_chain_head": SecurityAuditChain.headHash(),
+                                   "sentinel_protocol": SentinelProtocol.current,
+                                   "local_revocation": true]
+        guard let bytes = try? JSONSerialization.data(withJSONObject: body) else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = bytes
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(token, forHTTPHeaderField: "X-Nexilis-ZTA-Session")
+        SecurityAuditChain.append(event: auditEvent, detail: detail)
+        NXLogger.rasp.publicInfo("[RASP] temuan keamanan dilaporkan ke server sebelum otorisasi dicabut (\(auditEvent))")
+        sendPilotRequest(request) { _, response, error, _ in
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if error != nil || (!(200...299).contains(code) && code != 401) {
+                NXLogger.rasp.publicError("[RASP] laporan temuan keamanan tidak diterima server (HTTP \(code))")
+            }
+        }
+    }
+
+    /// A finding after the session opened (the mid-session network guard) ends the same way a failed
+    /// launch does: the authorization is revoked, the host is told (`ztaSessionError`, `onFailure`),
+    /// and the failure screen counts down and closes the app.
+    static func failDuringSession(_ error: NSError) {
+        onMain {
+            guard currentAuthorizationToken != nil || sessionReady else { return }
+            revokeLocalAuthorization(reason: "mid-session finding \(error.code)")
+            NXLogger.appAttest.publicError("[AppAttest] ❌ Gagal di tengah sesi: \(error.localizedDescription)")
+            NotificationCenter.default.post(name: .ztaSessionError, object: nil, userInfo: ["error": error])
+            presentErrorScreen(for: error)
+            onFailure?(error)
+        }
+    }
+
     private static let telemetryLock = NSLock()
     private static var telemetryFailures = 0
     private static var telemetryNextAttempt: TimeInterval = 0
@@ -969,6 +1034,13 @@ public enum APISZTA {
     private static func startObservingIfNeeded() {
         guard !observing else { return }
         observing = true
+
+        // RASPGuard calls this just before a runtime threat clears the session (modes 1 and 2), so
+        // the evidence still reaches the service under a live session and the service can revoke
+        // the install - otherwise only this process would know.
+        RASPGuard.shared().runtimeThreatReporter = { mask in
+            reportRuntimeThreatBeforeRevocation(mask: mask)
+        }
 
         NotificationCenter.default.addObserver(forName: .ztaSessionRetry,
                                                object: nil,
@@ -1764,6 +1836,8 @@ public enum APISZTA {
             // From here the session is live, so the signals that only arrive after launch have
             // somewhere to land: a signed pin rotation, a revoked install, the audit anchor.
             startStatusPollingIfNeeded()
+            // A proxy / VPN switched on from here is refused like one present at launch.
+            SentinelMidSessionNetworkGuard.start()
             // Evidence keeps its own cadence, five minutes against the status poll's fifteen. A
             // policy that is a quarter of an hour stale is fine; a compromise that is a quarter of
             // an hour unreported is not.

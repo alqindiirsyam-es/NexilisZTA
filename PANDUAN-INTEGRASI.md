@@ -81,6 +81,18 @@ Hanya kalau memakai `GeofencePolicy`:
 
 ---
 
+
+**Log diagnostik.** Di build Release, NexilisZTA, SecurityShield dan NexilisLite tidak menulis log
+diagnostik (`publicInfo`/`publicDebug` diam, `publicError` ditulis dengan teks tersamar) - log itu
+menjelaskan alur keamanan langkah demi langkah dan terbaca dari Console Mac / sysdiagnose. Untuk build QA
+atau pilot yang perlu log, tambahkan:
+
+```xml
+<key>NexilisDiagnosticLogging</key><true/>
+```
+
+Jangan biarkan kunci ini di build yang dirilis ke pengguna. Build Debug pustaka selalu menulis log.
+
 ## Langkah 3 — Import
 
 Tidak perlu bridging header. Seluruh header Objective-C dan C sudah menjadi public header pod, jadi cukup:
@@ -367,6 +379,70 @@ func raspGuard(_ guard: RASPGuard, didDetectThreats threats: UInt32) {
 func raspGuard(_ guard: RASPGuard, didDetectPinningFailureForHost host: String) {
     // pinning gagal — pertimbangkan menghentikan sesi
 }
+```
+
+Di mode 1 dan 2, sebelum otorisasi dicabut karena ancaman runtime, NexilisZTA mengirim temuannya ke
+server (`/zta/telemetry/events`) dengan sesi yang masih hidup. Server lalu bisa mencabut install itu
+juga (risiko berkelanjutan, kategori `runtime_instrumentation`), tidak hanya prosesnya.
+
+### Proxy / VPN yang dinyalakan di tengah sesi
+
+Gate boot (Barrier #1) menolak start di belakang proxy lokal atau VPN yang tidak tepercaya pada mode 1
+dan 2 (`-7413` / `-7414`). Proxy atau VPN yang **dinyalakan setelah sesi terbuka** sekarang diperlakukan
+sama: temuan dilaporkan ke server, otorisasi dicabut, `.ztaSessionError` dikirim, dan layar gagal
+(dengan kode dan pesan yang sama) menutup app. Tidak ada yang disimpan: launch berikutnya melewati gate
+boot lagi. Pemicunya perubahan jaringan (`NWPathMonitor`), app kembali ke depan, dan pemeriksaan tiap
+30 detik. VPN dengan prefix interface di `NexilisTrustedVPNInterfacePrefixes` tidak dianggap temuan.
+
+Aktif secara default (padanan `midsession_network_block` di Android). Mematikannya:
+
+```swift
+config.midSessionNetworkBlock = false          // embedded
+```
+```xml
+<key>MidSessionNetworkBlock</key><false/>      <!-- NexilisShield.plist -->
+```
+
+### Pinning backend milik app host
+
+Padanan `ztaProtector.pinnedHosts` di Android: satu deklarasi untuk dua sisi. Tulis di `Info.plist`
+app (`NSAppTransportSecurity > NSPinnedDomains`, iOS 14+):
+
+```xml
+<key>NSAppTransportSecurity</key>
+<dict>
+  <key>NSPinnedDomains</key>
+  <dict>
+    <key>api.customer.example</key>
+    <dict>
+      <key>NSIncludesSubdomains</key><true/>
+      <key>NSPinnedCAIdentities</key>
+      <array>
+        <dict><key>SPKI-SHA256-BASE64</key><string>PIN_CA_UTAMA_BASE64=</string></dict>
+        <dict><key>SPKI-SHA256-BASE64</key><string>PIN_CA_CADANGAN_BASE64=</string></dict>
+      </array>
+    </dict>
+  </dict>
+</dict>
+```
+
+- **iOS sendiri** memberlakukannya untuk semua request `URLSession` / `WKWebView` app (termasuk
+  Alamofire), seperti `networkSecurityConfig` di Android.
+- **NexilisZTA** membaca entri yang sama (`NexilisZTAConfiguration.pinnedHosts`, default dari
+  `Info.plist`) dan memberlakukannya di `PinnedURLSessionDelegate`. Untuk `URLSession` milik host yang
+  menangani trust sendiri: `URLSession(configuration: .default, delegate: PinnedURLSessionDelegate(), delegateQueue: nil)`.
+- Tiap host **wajib dua pin berbeda** (CA utama + cadangan). Kurang dari itu, semua koneksi ke host
+  tersebut ditolak dan log `[Pinning]` menyebut alasannya. Pin boleh cocok dengan sertifikat mana pun
+  di rantai (leaf atau CA penerbit).
+- Pin yang tidak cocok hanya **menolak koneksi** ke backend itu; tidak mencabut sesi ZTA. Domain ZTA
+  (`nexilis.io`) tetap memakai pin bawaan dan tidak bisa ditimpa di sini.
+- Kode Dart di app Flutter tidak lewat `URLSession`, jadi tidak tercakup.
+
+Menghitung pin dari sertifikat PEM:
+
+```sh
+openssl x509 -in issuing_ca.pem -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | openssl base64
 ```
 
 ### Menghapus jejak sesi

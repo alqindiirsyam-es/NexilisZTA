@@ -227,6 +227,7 @@ public final class NXShieldAutostart: NSObject {
         }
         config.securityPackSignerSPKIBase64 = optional("SecurityPackSignerSPKI")
         // Installed by APISZTA with the rest of the configuration, on either path (chain or not).
+        if let flag = s["MidSessionNetworkBlock"] as? Bool { config.midSessionNetworkBlock = flag }
         if let flag = s["PrivacyShield"] as? Bool {
             config.privacyShield = flag ? .all : .off
         } else if let d = s["PrivacyShield"] as? [String: Any] {
