@@ -11,6 +11,7 @@
 //
 
 import UIKit
+import SystemConfiguration
 
 #if SWIFT_PACKAGE
 // CocoaPods builds Swift and Objective-C as one mixed-language target, so these
@@ -57,7 +58,7 @@ public class ZTAErrorViewController: UIViewController {
 
     private let titleLabel: UILabel = {
         let label = UILabel()
-        label.text = "Verifikasi Gagal"
+        label.text = SentinelErrorText.title
         label.font = UIFont.systemFont(ofSize: 24, weight: .bold)
         label.textColor = .white
         label.textAlignment = .center
@@ -77,8 +78,8 @@ public class ZTAErrorViewController: UIViewController {
 
     private let errorCodeLabel: UILabel = {
         let label = UILabel()
-        label.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        label.textColor = UIColor.white.withAlphaComponent(0.35)
+        label.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+        label.textColor = UIColor.white.withAlphaComponent(0.5)
         label.textAlignment = .center
         label.numberOfLines = 0
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -260,159 +261,23 @@ public class ZTAErrorViewController: UIViewController {
             return
         }
 
-        // Map error code ke pesan yang user-friendly
-        let (title, message, isRetryable) = errorMessage(for: nsError)
-        titleLabel.text  = title
-        messageLabel.text = message
-        // Tampilkan error code di debug / untuk support.
-        //
-        // The reason line matters more than it looks. The mapped sentence above is deliberately
-        // generic, and it used to be the ONLY thing that survived: a photo of this screen showed
-        // "io.nexilis.appattest (1004)" and nothing else, so nobody could tell a gateway having a
-        // bad minute from the server genuinely refusing this device - two problems with opposite
-        // answers. The underlying failure carries the HTTP status and the server's own message;
-        // that is what support actually needs, so it is printed here.
-        var codeLine = "Error: \(nsError.domain) (\(nsError.code))"
-        if nsError.domain != NXAppAttestErrorDomain {
-            codeLine += " · state \(stateErrorCode(Int32(stateGet())))"
-        }
-        let reason = nsError.localizedDescription
-        if !reason.isEmpty, reason != message {
-            codeLine += "\n\(reason)"
-        }
-        if let failureReason = nsError.localizedFailureReason, !failureReason.isEmpty {
-            codeLine += "\n\(failureReason)"
-        }
-        errorCodeLabel.text = codeLine
+        // Fix: the screen named the failure by the layer that raised it - "io.nexilis.zta.protected
+        // (…) · state …" under the message, with the error's raw description and reason after it,
+        // which could be a class name or a server's JSON. The reader is owed what Android shows them
+        // (SplashActivity.userFacingError), and nothing of how the app is built: one sentence and the
+        // code from the Sentinel error-code list, which is what support looks up. The details go to
+        // the log instead.
+        let code = SentinelErrorText.code(for: nsError)
+        titleLabel.text = SentinelErrorText.title
+        messageLabel.text = SentinelErrorText.message(forCode: code)
+        errorCodeLabel.text = SentinelErrorText.countdown
+        NXLogger.general.publicError("[ErrorScreen] kode \(code) <- \(nsError.domain) (\(nsError.code)) \(nsError.localizedDescription) | \(nsError.localizedFailureReason ?? "")")
 
         // The exit button is always there. Support stays reachable whenever the server was the one
-        // saying no, or the condition is permanent.
+        // saying no.
         let serverRejected = nsError.domain == NXAppAttestErrorDomain
             && nsError.code == NXAppAttestError.serverRejected.rawValue
-        contactButton.isHidden  = isRetryable && !serverRejected
-    }
-
-    private let stateErrorTable: [(state: Int32, errorCode: Int32)] = [
-        (0, 2622),
-        (1, 6850),
-        (2, 3941),
-        (3, 1873),
-        (4, 9799),
-        (5, 2221),
-        (6, 4367),
-        (7, 2480),
-        (8, 1836),
-        (9, 9077),
-        (10, 5769),
-        (11, 4428),
-        (12, 8405),
-        (13, 8383),
-        (14, 5673),
-        (15, 2708),
-        (21, 2423),
-        (22, 2019),
-        (23, 5874)
-    ]
-
-    private func stateErrorCode(_ state: Int32) -> Int32 {
-        return stateErrorTable.first(where: { $0.state == state })?.errorCode ?? 0
-    }
-
-    private func errorMessage(for error: NSError) -> (title: String, message: String, retryable: Bool) {
-        guard error.domain == NXAppAttestErrorDomain else {
-            // Integrity and posture findings used to fall through to "Koneksi Gagal", which sent
-            // the reader to check a network that was fine. Named by the layer that raised them.
-            switch error.domain {
-            case "io.nexilis.zta.highassurance":
-                return ("Integritas Aplikasi Gagal",
-                        "Aplikasi ini tidak sesuai dengan rilis yang disetujui. Pasang ulang dari sumber resmi.",
-                        true)
-            case "io.nexilis.zta.protected", "io.nexilis.zta.preflight":
-                return ("Pemeriksaan Keamanan Gagal",
-                        "Kondisi perangkat tidak memenuhi syarat keamanan aplikasi ini.",
-                        true)
-            case "io.nexilis.shield":
-                return ("Konfigurasi Keamanan Tidak Valid",
-                        "Aplikasi ini dibungkus dengan konfigurasi keamanan yang tidak dapat dipakai.",
-                        true)
-            default:
-                return (
-                    "Koneksi Gagal",
-                    "Tidak dapat terhubung ke server. Periksa koneksi internet Anda.",
-                    true
-                )
-            }
-        }
-
-        switch error.code {
-        case 1000:
-            return (
-                "Perangkat Tidak Didukung",
-                "Fitur keamanan App Attest membutuhkan iPhone dengan chip A12 atau lebih baru.",
-                false
-            )
-        case 1001:
-            return (
-                "Gagal Membuat Kunci",
-                "Terjadi kesalahan saat menyiapkan kunci keamanan. Coba restart aplikasi.",
-                true
-            )
-        case 1002:
-            return (
-                "Verifikasi Apple Gagal",
-                "Apple tidak dapat memverifikasi keaslian aplikasi ini. Pastikan perangkat terhubung ke internet.",
-                true
-            )
-        case 1004:
-            // The support link stays visible below: the server is the one saying no.
-            return (
-                "Server Menolak Permintaan",
-                "Server tidak dapat memverifikasi perangkat Anda. Coba lagi, atau hubungi support jika masalah berlanjut.",
-                true
-            )
-        case 1007:
-            return (
-                "Secure Enclave Error",
-                "Terjadi kesalahan pada komponen keamanan perangkat. Coba restart perangkat Anda.",
-                true
-            )
-        case 1008:
-            return (
-                "Koneksi Gagal",
-                "Tidak dapat terhubung ke server keamanan. Periksa koneksi internet Anda.",
-                true
-            )
-        case 1005:
-            return (
-                "Sesi Kedaluwarsa",
-                "Token verifikasi telah expired. Silakan coba lagi.",
-                true
-            )
-        case 1010:
-            return (
-                "Enkripsi Gagal",
-                "Terjadi kesalahan pada proses kriptografi. Coba restart aplikasi.",
-                true
-            )
-        case 1011:
-            return (
-                "Verifikasi Belum Selesai",
-                "Proses verifikasi keamanan terputus sebelum selesai. Silakan coba lagi.",
-                true
-            )
-        case 1012:
-            return (
-                "Server Sedang Sibuk",
-                "Server keamanan sedang tidak dapat melayani permintaan. Coba lagi sebentar.",
-                true
-            )
-        default:
-            return (
-                "Verifikasi Gagal",
-                "Terjadi kesalahan saat memverifikasi keamanan aplikasi.",
-                true
-            )
-        }
+        contactButton.isHidden = !serverRejected && code != 3945 && !(9829...9836).contains(code)
     }
 
     // MARK: - Actions
@@ -471,5 +336,115 @@ public class ZTAErrorViewController: UIViewController {
                 self.iconView.transform = .identity
             }
         }
+    }
+}
+
+/// What a failed verification is called on screen, written the way Android writes it
+/// (zta-l-sdk SplashActivity) and numbered from the Sentinel error-code list
+/// ("Daftar Kode Error Lingkungan Perangkat"): one sentence and a four-digit code, never a class,
+/// a domain or a server's raw reply.
+enum SentinelErrorText {
+
+    static let title = "Pemeriksaan Keamanan Gagal"
+    static let countdown = "Aplikasi akan ditutup secara otomatis dalam 5 detik."
+    private static let sentence = "Perangkat/jaringan/OS/aplikasi tidak memenuhi syarat keamanan."
+
+    /// The line under the title. 7301 and 7302 say what they are, as Android does; every other code
+    /// is the one sentence with the code after it.
+    static func message(forCode code: Int) -> String {
+        switch code {
+        case 7301: return "Perangkat tidak memiliki akses internet.(7301)."
+        case 7302: return "Layanan tidak dapat diakses.(7302)."
+        default: return "\(sentence)(\(code))."
+        }
+    }
+
+    /// The code for a failure: one the error already carries - a server reply says "(8429)" - and
+    /// otherwise the code the list gives the condition iOS found.
+    static func code(for error: NSError) -> Int {
+        if let carried = carriedCode(in: error) {
+            return carried
+        }
+        switch error.domain {
+        case NXAppAttestErrorDomain:
+            switch error.code {
+            case 1004: return 8429                         // the server refused this device
+            case 1002, 1008, 1012: return reachable() ? 7302 : 7301
+            case 1013: return 9825                          // the connection is being intercepted
+            case 1001, 1003, 1005, 1006, 1007, 1009, 1010: return 9829  // an internal check broke off
+            case 1011: return 9831
+            default: return threatCode() ?? 3945
+            }
+        case "io.nexilis.zta.preflight":
+            switch error.code {
+            case -7410: return 9829                         // the local audit chain is broken
+            case -7411: return 9813                         // not the official release
+            case -7412: return UIScreen.screens.count > 1 ? 9823 : 9824
+            case -7413, -7414: return 9825                  // proxy / untrusted VPN
+            case -7415: return 3945
+            case let mask where mask > 0: return threatCode(mask: UInt32(truncatingIfNeeded: mask)) ?? 3945
+            default: return threatCode() ?? 3945
+            }
+        case "io.nexilis.zta.protected":
+            return threatCode() ?? 9833
+        case "io.nexilis.zta.highassurance":
+            return 4367                                     // not the approved release
+        case NSURLErrorDomain:
+            return reachable() ? 7302 : 7301
+        default:
+            return threatCode() ?? 3945
+        }
+    }
+
+    /// The list's code for what the device's own checks last found, most serious first.
+    private static func threatCode(mask: UInt32 = RASPGuard.shared().lastThreatMask) -> Int? {
+        let order: [(UInt32, Int)] = [
+            (UInt32(RASP_THREAT_JAILBREAK), 9805),           // root / jailbreak
+            (UInt32(RASP_THREAT_DEBUGGER), 9801),            // debugger attached
+            (UInt32(RASP_THREAT_FRIDA), 9803),               // Frida
+            (UInt32(RASP_THREAT_INJECTION), 9804),           // injected library
+            (UInt32(RASP_THREAT_HOOK_DETECTED), 9804),
+            (UInt32(RASP_THREAT_INLINE_HOOK), 9804),
+            (UInt32(RASP_THREAT_GOT_HOOK), 9804),
+            (UInt32(RASP_THREAT_REVERSE_TOOL), 9835),        // reverse-engineering tools
+            (UInt32(RASP_THREAT_SIMULATOR), 9818),           // simulator / emulator
+            (UInt32(RASP_THREAT_TAMPERED), 9813)             // app re-signed or modified
+        ]
+        return order.first(where: { mask & $0.0 != 0 })?.1
+    }
+
+    /// A four-digit code in brackets anywhere in the error or what it wraps - how the server and
+    /// Android write one.
+    private static func carriedCode(in error: NSError, depth: Int = 0) -> Int? {
+        guard depth < 4 else {
+            return nil
+        }
+        var texts = [error.localizedDescription, error.localizedFailureReason ?? ""]
+        texts += error.userInfo.values.compactMap { $0 as? String }
+        for text in texts {
+            if let range = text.range(of: "\\((\\d{4})\\)", options: .regularExpression) {
+                let digits = text[range].dropFirst().dropLast()
+                if let code = Int(digits) {
+                    return code
+                }
+            }
+        }
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return carriedCode(in: underlying, depth: depth + 1)
+        }
+        return nil
+    }
+
+    /// Whether the phone has a route to the internet at all - which decides between "no internet"
+    /// (7301) and "the service cannot be reached" (7302).
+    private static func reachable() -> Bool {
+        guard let reachability = SCNetworkReachabilityCreateWithName(nil, "apple.com") else {
+            return false
+        }
+        var flags = SCNetworkReachabilityFlags()
+        guard SCNetworkReachabilityGetFlags(reachability, &flags) else {
+            return false
+        }
+        return flags.contains(.reachable) && !flags.contains(.connectionRequired)
     }
 }
